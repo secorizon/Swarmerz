@@ -1,0 +1,237 @@
+# Author: Laurent Gaffié, Secorizon.com
+# SPDX-License-Identifier: GPL-3.0-only
+# This file is part of Swarmerz, a terminal operations deck for independent model swarms.
+
+from __future__ import annotations
+
+import asyncio
+import io
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from urllib.error import HTTPError
+from unittest import mock
+
+from swarmerz.orchestration.codex_appserver import CodexAppServer
+from swarmerz.orchestration.live_control import LiveControl
+from swarmerz.orchestration.models import CommandSpec, ConfigError
+from swarmerz.orchestration.opencode_permissions import OpenCodeEndpoint, steer_session
+
+
+class LiveControlTests(unittest.TestCase):
+    def test_status_names_queued_ollama_model(self) -> None:
+        control = LiveControl({"ollama-local": "swarmerz:q38"})
+        control.active.add("ollama-local")
+        self.assertEqual(
+            control.status(), "swarmerz:q38 (ollama-local): queued to start"
+        )
+        control.mark_started("ollama-local")
+        self.assertEqual(
+            control.status(),
+            "swarmerz:q38 (ollama-local): started; steering transport not ready",
+        )
+        control.register_opencode(
+            "ollama-local",
+            OpenCodeEndpoint("http://127.0.0.1:1234", "private", Path("/tmp/ollama")),
+        )
+        self.assertEqual(
+            control.status(), "swarmerz:q38 (ollama-local): OpenCode starting"
+        )
+
+    def test_opencode_broadcast_targets_only_unfinished_children(self) -> None:
+        async def scenario() -> list[str]:
+            control = LiveControl()
+            control.register_opencode(
+                "glm", OpenCodeEndpoint("http://127.0.0.1:1234", "private", Path("/tmp/glm"))
+            )
+            control.set_opencode_session("glm", "ses_parent")
+            control.parent_returned("glm")
+            with mock.patch("swarmerz.orchestration.live_control.list_worker_sessions", return_value={
+                "data": [
+                    {"id": "ses_live", "parentID": "ses_parent"},
+                    {"id": "ses_done", "parentID": "ses_parent", "outcome": "succeeded"},
+                    {"id": "ses_other", "parentID": "different"},
+                ]
+            }), mock.patch("swarmerz.orchestration.live_control.steer_session") as steer:
+                outcome = await control.send("Please finish")
+                self.assertEqual(steer.call_count, 1)
+                self.assertEqual(steer.call_args.args[:2], ("ses_live", "Please finish"))
+                return outcome
+        self.assertEqual(asyncio.run(scenario()), ["glm: delivered to 1/1 active session(s)"])
+
+    def test_codex_steering_uses_active_turn_id(self) -> None:
+        async def scenario() -> None:
+            client = CodexAppServer()
+            client.thread_id = "thread-a"
+            client.turn_id = "turn-b"
+            with mock.patch.object(client, "_request", new_callable=mock.AsyncMock) as request:
+                await client.steer("Wrap up")
+                request.assert_awaited_once_with("turn/steer", {
+                    "threadId": "thread-a",
+                    "input": [{"type": "text", "text": "Wrap up"}],
+                    "expectedTurnId": "turn-b",
+                })
+        asyncio.run(scenario())
+
+    def test_opencode_request_uses_steer_not_a_new_run(self) -> None:
+        endpoint = OpenCodeEndpoint("http://127.0.0.1:1234", "private", Path("/tmp/glm"))
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"data":{"sessionID":"ses_live"}}'
+        with mock.patch("swarmerz.orchestration.opencode_permissions.urlopen", return_value=response) as send:
+            steer_session("ses_live", "Wrap up", endpoint=endpoint)
+        request = send.call_args.args[0]
+        self.assertEqual(request.get_method(), "POST")
+        self.assertEqual(json.loads(request.data), {
+            "text": "Wrap up", "delivery": "steer", "resume": True,
+        })
+        self.assertEqual(request.get_header("X-opencode-directory"), "/tmp/glm")
+
+    def test_opencode_steering_reports_http_error_body(self) -> None:
+        endpoint = OpenCodeEndpoint("http://127.0.0.1:1234", "private", Path("/tmp/glm"))
+        invalid = HTTPError(
+            "http://127.0.0.1:1234", 400, "Bad Request", {},
+            io.BytesIO(b'{"message":"Rejected steering input"}'),
+        )
+        with mock.patch(
+            "swarmerz.orchestration.opencode_permissions.urlopen", side_effect=invalid
+        ), self.assertRaisesRegex(ConfigError, r'HTTP 400: .*Rejected steering input'):
+            steer_session("ses_live", "Wrap up", endpoint=endpoint)
+
+    def test_opencode_steering_falls_back_to_nested_v2_schema(self) -> None:
+        endpoint = OpenCodeEndpoint("http://127.0.0.1:1234", "private", Path("/tmp/glm"))
+        missing_prompt = HTTPError(
+            "http://127.0.0.1:1234", 400, "Bad Request", {},
+            io.BytesIO(b'{"message":"Missing key at [\\"prompt\\"]"}'),
+        )
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"data":{"sessionID":"ses_live"}}'
+        with mock.patch(
+            "swarmerz.orchestration.opencode_permissions.urlopen",
+            side_effect=[missing_prompt, response],
+        ) as send:
+            steer_session("ses_live", "Wrap up", endpoint=endpoint)
+        self.assertEqual(json.loads(send.call_args_list[0].args[0].data), {
+            "text": "Wrap up", "delivery": "steer", "resume": True,
+        })
+        self.assertEqual(json.loads(send.call_args_list[1].args[0].data), {
+            "prompt": {"text": "Wrap up"}, "delivery": "steer", "resume": True,
+        })
+
+    def test_codex_model_refresh_timeout_is_deduplicated_but_preserved(self) -> None:
+        async def scenario(root: Path) -> None:
+            client = CodexAppServer()
+            stderr = asyncio.StreamReader()
+            refresh = (
+                "ERROR codex_models_manager::manager: failed to refresh available models: "
+                "request timed out\n"
+            )
+            ttl = (
+                "\033[2m2026-09-30T23:52:40Z\033[0m \033[31mERROR\033[0m "
+                "\033[2mcodex_models_manager::manager\033[0m\033[2m:\033[0m "
+                "failed to renew cache TTL: EOF while parsing a value at line 1 column 0\n"
+            )
+            stale_poll = (
+                "\033[31mERROR\033[0m \033[2mcodex_core::tools::router\033[0m: "
+                "error=write_stdin failed: Unknown process id 18396\n"
+            )
+            stderr.feed_data(
+                (refresh + refresh + ttl + ttl + stale_poll + stale_poll
+                 + "WARN another warning\n").encode()
+            )
+            stderr.feed_eof()
+            client.process = SimpleNamespace(stderr=stderr)
+            messages: list[str] = []
+            log = root / "stderr.log"
+            await client._read_stderr(log, messages.append)
+            self.assertEqual(messages, [
+                "WARNING: Codex model catalog cache refresh failed; continuing with the configured model",
+                "WARNING: Codex command polling raced with process exit; the worker can continue",
+                "WARN another warning",
+            ])
+            self.assertEqual(
+                log.read_text(),
+                refresh + refresh + ttl + ttl + stale_poll + stale_poll
+                + "WARN another warning\n",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            asyncio.run(scenario(Path(directory)))
+
+    def test_codex_appserver_turn_produces_answer_without_model_call(self) -> None:
+        class FakeWriter:
+            def __init__(self, reader: asyncio.StreamReader) -> None:
+                self.reader = reader
+                self.messages: list[dict[str, object]] = []
+
+            def write(self, payload: bytes) -> None:
+                request = json.loads(payload)
+                self.messages.append(request)
+                request_id = request.get("id")
+                if request_id is None:
+                    return
+                method = request["method"]
+                if method == "initialize":
+                    response = {"id": request_id, "result": {"userAgent": "fake"}}
+                elif method == "thread/start":
+                    response = {"id": request_id, "result": {"thread": {"id": "thread-a"}}}
+                else:
+                    response = {"id": request_id, "result": {"turn": {
+                        "id": "turn-b", "status": "inProgress",
+                    }}}
+                self.reader.feed_data((json.dumps(response) + "\n").encode())
+                if method == "turn/start":
+                    answer = {"answer": "Test response", "key_points": [],
+                              "assumptions": [], "uncertainties": [], "sources": [],
+                              "workstreams": [], "confidence": 0.5}
+                    for event in (
+                        {"method": "turn/started", "params": {
+                            "threadId": "thread-a", "turn": {"id": "turn-b"}}},
+                        {"method": "item/completed", "params": {
+                            "threadId": "thread-a", "item": {
+                                "type": "agentMessage", "text": json.dumps(answer),
+                            }}},
+                        {"method": "turn/completed", "params": {
+                            "turn": {"id": "turn-b", "status": "completed"}}},
+                    ):
+                        self.reader.feed_data((json.dumps(event) + "\n").encode())
+
+            async def drain(self) -> None:
+                pass
+
+        async def scenario(root: Path) -> None:
+            stdout = asyncio.StreamReader()
+            stderr = asyncio.StreamReader()
+            stderr.feed_eof()
+            writer = FakeWriter(stdout)
+            fake_process = SimpleNamespace(
+                stdin=writer, stdout=stdout, stderr=stderr, returncode=0, pid=123,
+            )
+            spec = CommandSpec(
+                argv=("codex", "exec", "--output-last-message", "answer.json", "prompt"),
+                cwd=root, env={}, artifact_path=root / "answer.json",
+            )
+            engine = SimpleNamespace(effective_model="gpt-test", reasoning_effort="high",
+                                     timeout_seconds=10, swarm_size=4)
+            client = CodexAppServer()
+            with mock.patch("swarmerz.orchestration.codex_appserver.asyncio.create_subprocess_exec",
+                            new_callable=mock.AsyncMock, return_value=fake_process) as launch:
+                await client.start(spec, engine, stdout_path=root / "stdout.jsonl",
+                                   stderr_path=root / "stderr.log", emit=lambda _: None)
+                result = await client.run(spec, engine)
+            self.assertIn("agents.max_concurrent_threads_per_session=4", launch.call_args.args)
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(json.loads(spec.artifact_path.read_text())["answer"], "Test response")
+            turn_request = next(item for item in writer.messages if item.get("method") == "turn/start")
+            self.assertEqual(turn_request["params"]["effort"], "high")
+            stdout.feed_eof()
+            await client.close()
+
+        with tempfile.TemporaryDirectory() as directory:
+            asyncio.run(scenario(Path(directory)))
+
+if __name__ == "__main__":
+    unittest.main()

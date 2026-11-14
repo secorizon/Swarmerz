@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "Author: Laurent Gaffié, Secorizon.com. SPDX-License-Identifier: GPL-3.0-only. This file is part of Swarmerz, a terminal operations deck for independent model swarms.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "summary": {"type": "string"},
+    "agreement": {"type": "array", "items": {"type": "string"}},
+    "disagreements": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "topic": {"type": "string"},
+          "positions": {"type": "array", "items": {"type": "string"}},
+          "assessment": {"type": "string"}
+        },
+        "required": ["topic", "positions", "assessment"]
+      }
+    },
+    "answer_assessments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "answer_id": {"type": "string"},
+          "strengths": {"type": "array", "items": {"type": "string"}},
+          "weaknesses": {"type": "array", "items": {"type": "string"}},
+          "factual_risks": {"type": "array", "items": {"type": "string"}}
+        },
+        "required": ["answer_id", "strengths", "weaknesses", "factual_risks"]
+      }
+    },
+    "validated_findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "title": {"type": "string"},
+          "severity": {
+            "type": "string",
+            "enum": ["critical", "high", "medium", "low", "informational", "unknown"]
+          },
+          "source_answer_ids": {
+            "type": "array",
+            "items": {"type": "string"}
+          },
+          "validation": {"type": "string"},
+          "evidence": {"type": "array", "items": {"type": "string"}},
+          "provenance_class": {
+            "type": "string",
+            "enum": ["independent_discovery", "prior_artifact_corroboration", "derived"]
+          },
+          "validation_method": {
+            "type": "string",
+            "enum": ["executed_reproduction", "source_inspection", "reasoning_only"]
+          },
+          "reproduction": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "commands": {"type": "array", "items": {"type": "string"}},
+              "observed_result": {"type": "string"},
+              "artifact_refs": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["commands", "observed_result", "artifact_refs"]
+          }
+        },
+        "required": [
+          "title",
+          "severity",
+          "source_answer_ids",
+          "validation",
+          "evidence",
+          "provenance_class",
+          "validation_method",
+          "reproduction"
+        ]
+      }
+    },
+    "unresolved_questions": {"type": "array", "items": {"type": "string"}},
+    "recommended_answer": {"type": "string"},
+    "confidence": {"type": "number"}
+  },
+  "required": [
+    "summary",
+    "agreement",
+    "disagreements",
+    "answer_assessments",
+    "validated_findings",
+    "unresolved_questions",
+    "recommended_answer",
+    "confidence"
+  ]
+}

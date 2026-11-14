@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "Author: Laurent Gaffié, Secorizon.com. SPDX-License-Identifier: GPL-3.0-only. This file is part of Swarmerz, a terminal operations deck for independent model swarms.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "summary": {"type": "string"},
+    "finding_assessments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "finding_index": {"type": "integer", "minimum": 0},
+          "status": {"type": "string", "enum": ["confirmed", "rejected", "uncertain"]},
+          "assessment": {"type": "string"},
+          "validation_method": {
+            "type": "string",
+            "enum": ["executed_reproduction", "source_inspection", "reasoning_only"]
+          },
+          "evidence": {"type": "array", "items": {"type": "string"}}
+        },
+        "required": ["finding_index", "status", "assessment", "validation_method", "evidence"]
+      }
+    },
+    "recommended_answer_assessment": {"type": "string"},
+    "confidence": {"type": "number"}
+  },
+  "required": ["summary", "finding_assessments", "recommended_answer_assessment", "confidence"]
+}

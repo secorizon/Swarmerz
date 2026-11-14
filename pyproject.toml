@@ -1,0 +1,68 @@
+# Author: Laurent Gaffié, Secorizon.com
+# SPDX-License-Identifier: GPL-3.0-only
+# This file is part of Swarmerz, a terminal operations deck for independent model swarms.
+
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "swarmerz"
+dynamic = ["version"]
+description = "Consensus-driven multi-model security audit orchestration"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
+authors = [
+  { name = "Laurent Gaffié" },
+]
+keywords = [
+  "security",
+  "audit",
+  "multi-agent",
+  "multi-model",
+  "vulnerability-research",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Information Technology",
+  "Intended Audience :: Developers",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Security",
+]
+dependencies = [
+  "jsonschema>=4.19,<5",
+  "prompt-toolkit>=3.0.52,<4",
+]
+
+[project.urls]
+Homepage = "https://secorizon.com"
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+release = ["build>=1.2,<2"]
+
+[project.scripts]
+swarmerz = "swarmerz.cli:main"
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.dynamic]
+version = { attr = "swarmerz.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["swarmerz*"]
+
+[tool.setuptools.package-data]
+"swarmerz.orchestration" = ["schemas/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

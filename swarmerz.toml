@@ -1,0 +1,213 @@
+# Author: Laurent Gaffié, Secorizon.com
+# SPDX-License-Identifier: GPL-3.0-only
+# This file is part of Swarmerz, a terminal operations deck for independent model swarms.
+
+schema_version = 1
+output_root = "./swarm-runs"
+# This file is a hosted, high-capacity example profile, not a required roster.
+# A deployment may instead use 2–26 local, LAN, hosted, or mixed hunters.
+# All configured parents currently start together; this value is a capacity
+# declaration and must be at least the number of active [[hunters]] tables.
+max_parallel_hunters = 10
+# Require three sealed hunter answers before starting primary adjudication.
+# With seven active hunters below, this allows four to fail.
+minimum_answers = 3
+# Native OpenCode hunters are monitored through their child-session outcomes.
+opencode_worker_timeout_seconds = 3600
+opencode_worker_poll_seconds = 30
+# When all but one child succeeded and the parent wrote a valid answer after
+# those outcomes, stop waiting if the remaining child produces no output.
+opencode_answer_quiet_seconds = 180
+# If a child is absent from OpenCode's active-session set and its session
+# metadata stops changing, resume it once; abandon it after one more interval.
+opencode_orphan_quiet_seconds = 600
+# Custom OpenCode command adapters without session monitoring may write a late artifact.
+opencode_artifact_grace_seconds = 60
+# One bounded resume pass consolidates terminal workers or abandons timed-out stragglers.
+opencode_finalize_timeout_seconds = 900
+# Stop that resume once its fresh answer is valid and unchanged for this long.
+opencode_finalize_answer_quiet_seconds = 60
+# Retry only failed Codex jobs whose logs show a transient transport/DNS failure.
+codex_transport_retries = 2
+codex_retry_delay_seconds = 10
+
+[storage]
+# Disposable compiler, package-manager, and per-run scratch data lives on the SSD.
+# Deleting this directory must never remove reports, findings, PoCs, or sealed evidence.
+cache_root = "~/.cache/swarmerz"
+max_cache_gib = 40
+max_cache_age_days = 30
+failed_scratch_retention_days = 7
+maintenance_interval_hours = 24
+# Completed rounds keep sealed evidence and raw logs, then remove reproducible workspaces.
+cleanup_successful_workspaces = true
+
+[context]
+# Optional. Prefer --context on the first run of a named session.
+# path = "/absolute/path/to/anything"
+# false safely skips symlink entries; true preserves them in the frozen snapshot.
+allow_symlinks = false
+# Skip generated artifacts and repository-local agent metadata; source files remain in scope.
+exclude = ["target", "build", ".gradle", "node_modules", ".venv", ".agents", "CLAUDE.md"]
+
+[isolation]
+mode = "workspace"
+inherit_environment = false
+# Opt-in: use one OpenCode server, password, HOME, and state root per native
+# hunter. This improves cross-hunter separation but is still a same-user
+# application boundary, not an OS sandbox. The shared mode remains the default.
+opencode_server_mode = "shared"
+
+# Active hosted example fleet. Replace, remove, or add tables to match the
+# deployment. Each hunter needs at least two effective child workstreams;
+# workers and subagents are aliases for capacity, so the larger value wins.
+[[hunters]]
+id = "deepseek"
+harness = "opencode"
+harness_version = "2.3.0"
+provider = "alibaba-token-plan"
+model = "deepseek-v4.1-flash-1017"
+reasoning_effort = "max"
+supported_efforts = ["default","max"]
+timeout_seconds = 14400
+workers = 4
+subagents = 4
+pass_env = []
+
+[[hunters]]
+id = "glm"
+harness = "opencode"
+harness_version = "2.3.0"
+provider = "zai-coding-plan"
+model = "glm-5.3"
+reasoning_effort = "max"
+supported_efforts = ["default", "max"]
+timeout_seconds = 14400
+workers = 4
+subagents = 4
+pass_env = []
+
+[[hunters]]
+id = "kimi"
+harness = "opencode"
+harness_version = "2.3.0"
+provider = "kimi-code-plan-global"
+# OpenCode exposes Kimi K3.1 Pro on this route under the exact ID below.
+model = "k3.1-pro"
+reasoning_effort = "high"
+supported_efforts = ["high"]
+timeout_seconds = 14400
+workers = 4
+subagents = 4
+pass_env = []
+
+[[hunters]]
+id = "mimo"
+harness = "opencode"
+harness_version = "2.3.0"
+provider = "xiaomi-token-plan-sgp"
+model = "mimo-v2.6-pro"
+# Xiaomi exposes deep thinking as thinking.type=enabled|disabled rather than
+# OpenCode effort variants. MiMo V2.6 Pro enables it by default, so omit #variant.
+reasoning_effort = "default"
+supported_efforts = ["default"]
+timeout_seconds = 14400
+workers = 4
+subagents = 4
+pass_env = []
+
+# Grok 4.7 through the xAI connection already stored in OpenCode.
+[[hunters]]
+id = "grok"
+harness = "opencode"
+harness_version = "2.3.0"
+provider = "xai"
+model = "grok-4.7"
+reasoning_effort = "xhigh"
+supported_efforts = ["xhigh"]
+timeout_seconds = 14400
+workers = 4
+subagents = 4
+pass_env = []
+
+# Qwen3.8 Max through the Alibaba Token Plan.
+[[hunters]]
+id = "qwen"
+harness = "opencode"
+harness_version = "2.3.0"
+provider = "alibaba-token-plan"
+model = "qwen3.8-max"
+reasoning_effort = "xhigh"
+supported_efforts = ["default", "low", "medium", "xhigh"]
+timeout_seconds = 14400
+worker_timeout_seconds = 7200
+workers = 4
+subagents = 4
+pass_env = []
+
+# Local or LAN Ollama hunter. Use the exact name shown by `ollama list` and an
+# endpoint this machine can reach. Repeat with a distinct ID/model or approach
+# for a fully local fleet; at least two independent parents are required.
+# Start with modest fan-out when several parents share one inference server.
+#[[hunters]]
+#id = "ollama-local"
+#harness = "opencode"
+#harness_version = "2.3.0"
+#provider = "ollama"
+#model = "swarmerz:q38"
+#ollama_base_url = "http://192.168.8.163:11434/v1"
+#reasoning_effort = "default"
+#supported_efforts = ["default"]
+#timeout_seconds = 14400
+#workers = 2
+#subagents = 2
+#pass_env = []
+
+[[hunters]]
+id = "codex"
+harness = "codex-exec"
+harness_version = "0.169.0"
+provider = "openai"
+# Daybreak performs the independent audit; model availability is checked before launch.
+model = "gpt-daybreak-blue-latest"
+reasoning_effort = "xhigh"
+supported_efforts = ["low", "medium", "high", "xhigh", "max"]
+timeout_seconds = 14400
+workers = 4
+subagents = 4
+pass_env = ["CODEX_API_KEY"]
+
+[analyzer]
+# The shipped example uses native Codex. For local-only adjudication, replace
+# this table with the command-adapter example documented in README.md.
+id = "codex-analyzer"
+harness = "codex-exec"
+harness_version = "0.169.0"
+provider = "openai"
+# Review every hunter report with GPT-5.6-Sol.
+model = "gpt-5.6-sol"
+reasoning_effort = "xhigh"
+supported_efforts = ["low", "medium", "high", "xhigh", "max"]
+timeout_seconds = 7200
+blind_hunter_identity = true
+# Optional: run an additional independent judge pass before launching hunters.
+# Disabled by default so hunters launch after setup and the judge runs once,
+# after the configured sealed-answer quorum is reached.
+baseline_first = false
+pass_env = ["CODEX_API_KEY"]
+
+# Optional independent confirmation gate. When present, a fresh verifier
+# reviews every primary finding and only confirmed findings reach later rounds.
+# A command adapter may target a local or hosted runtime; it receives {phase}, {answers},
+# {primary_analysis}, {schema}, and {result} template values.
+#[secondary_analyzer]
+#id = "independent-verifier"
+#harness = "command"
+#harness_version = "1"
+#provider = "another-provider"
+#model = "another-model"
+#reasoning_effort = "high"
+#supported_efforts = ["high"]
+#timeout_seconds = 7200
+#blind_hunter_identity = true
+#command = ["/absolute/path/to/verifier-adapter", "--schema", "{schema}", "--output", "{result}"]

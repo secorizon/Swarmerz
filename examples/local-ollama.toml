@@ -1,0 +1,79 @@
+# Author: Laurent Gaffié, Secorizon.com
+# SPDX-License-Identifier: GPL-3.0-only
+# This file is part of Swarmerz, a terminal operations deck for independent model swarms.
+
+schema_version = 1
+output_root = "../swarm-runs"
+max_parallel_hunters = 2
+minimum_answers = 2
+
+[storage]
+cache_root = "~/.cache/swarmerz"
+max_cache_gib = 40
+max_cache_age_days = 30
+failed_scratch_retention_days = 7
+maintenance_interval_hours = 24
+cleanup_successful_workspaces = true
+
+[context]
+allow_symlinks = false
+exclude = ["target", "build", ".gradle", "node_modules", ".venv", ".agents", "CLAUDE.md"]
+
+[isolation]
+mode = "workspace"
+inherit_environment = false
+# Optional same-user separation: one private OpenCode HOME/state root per parent.
+# opencode_server_mode = "per_hunter"
+
+# Replace both names with exact, tool-capable entries from `ollama list`.
+[[hunters]]
+id = "local-a"
+harness = "opencode"
+harness_version = "2.3.0"
+provider = "ollama"
+model = "REPLACE-WITH-LOCAL-MODEL-A"
+ollama_base_url = "http://127.0.0.1:11434/v1"
+reasoning_effort = "default"
+supported_efforts = ["default"]
+timeout_seconds = 14400
+workers = 2
+subagents = 2
+pass_env = []
+
+[[hunters]]
+id = "local-b"
+harness = "opencode"
+harness_version = "2.3.0"
+provider = "ollama"
+model = "REPLACE-WITH-LOCAL-MODEL-B"
+ollama_base_url = "http://127.0.0.1:11434/v1"
+reasoning_effort = "default"
+supported_efforts = ["default"]
+timeout_seconds = 14400
+workers = 2
+subagents = 2
+pass_env = []
+
+# A local judge is a command adapter today. It handles the `analysis` phase by
+# default and must also handle `baseline` if baseline_first is explicitly enabled.
+[analyzer]
+id = "local-judge"
+harness = "command"
+harness_version = "1"
+provider = "local"
+model = "REPLACE-WITH-LOCAL-JUDGE"
+reasoning_effort = "high"
+supported_efforts = ["high"]
+timeout_seconds = 7200
+blind_hunter_identity = true
+baseline_first = false
+command = [
+  "/absolute/path/to/local-judge-adapter",
+  "--phase", "{phase}",
+  "--workspace", "{workspace}",
+  "--answers", "{answers}",
+  "--primary-analysis", "{primary_analysis}",
+  "--schema", "{schema}",
+  "--output", "{result}",
+  "--model", "{model}",
+]

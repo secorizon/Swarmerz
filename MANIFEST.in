@@ -1,0 +1,22 @@
+# Author: Laurent Gaffié, Secorizon.com
+# SPDX-License-Identifier: GPL-3.0-only
+# This file is part of Swarmerz, a terminal operations deck for independent model swarms.
+
+include LICENSE
+include AUTHORS.md
+include README.md
+include pyproject.toml
+recursive-include src/swarmerz *.py
+recursive-include src/swarmerz/orchestration/schemas *.json
+prune .github
+prune bin
+prune docs
+prune examples
+prune tests
+exclude swarmerz.toml
+exclude output.html
+exclude output2.html
+exclude swarmerz-consensus-is-the-exploit.md
+global-exclude __pycache__ *.py[cod] .DS_Store
+global-exclude *.crt *.der *.env *.key *.p8 *.pem *.p12 *.pfx
+global-exclude .env .netrc .npmrc .pypirc credentials credentials.json secrets.json
