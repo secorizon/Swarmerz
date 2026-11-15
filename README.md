@@ -4,7 +4,7 @@ SPDX-License-Identifier: GPL-3.0-only
 This file is part of Swarmerz, a terminal operations deck for independent model swarms.
 -->
 
-# SECORIZON - SWARMERZ  //  CONSENSUS IS THE EXPLOIT.
+# SECORIZON - SWARMERZ
 
 **Author:** Laurent Gaffié, [Secorizon.com](https://secorizon.com)
 
