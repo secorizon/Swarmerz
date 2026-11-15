@@ -19,6 +19,7 @@ from swarmerz.clipboard import copy_to_clipboard
 def test_desktop_helper_receives_exact_text_and_failure_falls_back(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exit_code: int
 ) -> None:
+    monkeypatch.setattr("swarmerz.clipboard.sys.platform", "linux")
     received = tmp_path / "received.txt"
     helper = tmp_path / "xclip"
     helper.write_text(
@@ -74,6 +75,7 @@ def test_ssh_copy_targets_terminal_instead_of_remote_desktop(
 def test_wayland_wl_copy_receives_exact_text(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr("swarmerz.clipboard.sys.platform", "linux")
     received = tmp_path / "received.txt"
     helper = tmp_path / "wl-copy"
     helper.write_text(
@@ -100,6 +102,7 @@ def test_wayland_wl_copy_receives_exact_text(
 def test_wayland_vte_without_wl_copy_reports_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr("swarmerz.clipboard.sys.platform", "linux")
     for name in ("SSH_CONNECTION", "SSH_TTY", "DISPLAY", "TMUX"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-test")
