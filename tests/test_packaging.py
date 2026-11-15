@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+import sysconfig
 import tarfile
 import zipfile
 
@@ -135,6 +136,11 @@ def test_release_artifacts_are_installable_and_contain_only_runtime_material(
         "PIP_DISABLE_PIP_VERSION_CHECK": "1",
         "PIP_NO_INDEX": "1",
     }
+    isolated_env = {
+        name: value
+        for name, value in env.items()
+        if name not in {"PYTHONHOME", "PYTHONPATH"}
+    }
     subprocess.run(
         [
             sys.executable,
@@ -208,17 +214,49 @@ def test_release_artifacts_are_installable_and_contain_only_runtime_material(
 
     environment = tmp_path / "installed"
     subprocess.run(
-        [sys.executable, "-m", "venv", "--system-site-packages", str(environment)],
+        [sys.executable, "-m", "venv", str(environment)],
         check=True,
         capture_output=True,
         text=True,
     )
     python = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     command = environment / ("Scripts/swarmerz.exe" if os.name == "nt" else "bin/swarmerz")
+
+    # Keep this artifact smoke test offline while making it independent of
+    # whether pytest itself runs inside a virtual environment. A nested venv's
+    # --system-site-packages only exposes the base interpreter, not its parent
+    # venv, so share the current environment's already-installed dependencies
+    # explicitly. The nested site-packages directory remains first on sys.path.
     subprocess.run(
         [str(python), "-m", "pip", "install", "--no-deps", str(wheel)],
         check=True,
-        env=env,
+        env=isolated_env,
+        capture_output=True,
+        text=True,
+    )
+    nested_site = subprocess.run(
+        [str(python), "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+        check=True,
+        env=isolated_env,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (Path(nested_site) / "swarmerz-test-runtime.pth").write_text(
+        sysconfig.get_path("purelib") + "\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [
+            str(python),
+            "-c",
+            (
+                "from pathlib import Path; import sys, swarmerz; "
+                "assert Path(swarmerz.__file__).resolve().is_relative_to("
+                "Path(sys.prefix).resolve())"
+            ),
+        ],
+        check=True,
+        env=isolated_env,
         capture_output=True,
         text=True,
     )
@@ -226,6 +264,7 @@ def test_release_artifacts_are_installable_and_contain_only_runtime_material(
         [str(command), "--version"],
         check=True,
         cwd=tmp_path,
+        env=isolated_env,
         capture_output=True,
         text=True,
     )
@@ -233,6 +272,7 @@ def test_release_artifacts_are_installable_and_contain_only_runtime_material(
         [str(command), "doctor", "--json"],
         check=True,
         cwd=tmp_path,
+        env=isolated_env,
         capture_output=True,
         text=True,
     )
