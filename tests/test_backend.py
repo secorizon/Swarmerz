@@ -120,12 +120,26 @@ def test_review_command_preserves_config_overrides_and_round_identity(
     )
 
 
-def test_review_launcher_stays_inside_the_swarmerz_product() -> None:
-    executable = Path(_swarmerz_cli_executable())
+def test_review_launcher_uses_checkout_script_when_available(tmp_path: Path) -> None:
+    checkout = tmp_path / "Swarmerz"
+    module = checkout / "src" / "swarmerz" / "backend.py"
+    launcher = checkout / "bin" / "swarmerz"
+    module.parent.mkdir(parents=True)
+    launcher.parent.mkdir()
+    launcher.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
 
-    assert executable.name == "swarmerz"
-    assert executable.parent.name == "bin"
-    assert executable.parent.parent.name == "Swarmerz"
+    with mock.patch("swarmerz.backend.__file__", str(module)):
+        assert Path(_swarmerz_cli_executable()) == launcher
+
+
+def test_review_launcher_uses_console_entry_point_when_installed(
+    tmp_path: Path,
+) -> None:
+    module = tmp_path / "site-packages" / "swarmerz" / "backend.py"
+    module.parent.mkdir(parents=True)
+
+    with mock.patch("swarmerz.backend.__file__", str(module)):
+        assert _swarmerz_cli_executable() == "swarmerz"
 
 
 def test_open_review_resumes_after_first_success(tmp_path: Path) -> None:
