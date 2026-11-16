@@ -210,15 +210,35 @@ class LiveControlTests(unittest.TestCase):
             fake_process = SimpleNamespace(
                 stdin=writer, stdout=stdout, stderr=stderr, returncode=0, pid=123,
             )
+            scratch = (
+                root / "cache" / "scratch" / "session" / "round" / "roles" / "codex"
+            )
             spec = CommandSpec(
                 argv=("codex", "exec", "--output-last-message", "answer.json", "prompt"),
-                cwd=root, env={}, artifact_path=root / "answer.json",
+                cwd=root,
+                env={
+                    "SWARMERZ_CACHE_ROOT": str(root / "cache"),
+                    "SWARMERZ_SCRATCH_DIR": str(scratch),
+                    "TMPDIR": str(scratch / "tmp"),
+                    "TMP": str(scratch / "tmp"),
+                    "TEMP": str(scratch / "tmp"),
+                },
+                artifact_path=root / "answer.json",
             )
             engine = SimpleNamespace(effective_model="gpt-test", reasoning_effort="high",
                                      timeout_seconds=10, swarm_size=4)
             client = CodexAppServer()
-            with mock.patch("swarmerz.orchestration.codex_appserver.asyncio.create_subprocess_exec",
-                            new_callable=mock.AsyncMock, return_value=fake_process) as launch:
+
+            async def fake_launch(*_args: object, **_kwargs: object) -> object:
+                self.assertTrue(Path(spec.env["SWARMERZ_SCRATCH_DIR"]).is_dir())
+                self.assertTrue(Path(spec.env["TMPDIR"]).is_dir())
+                return fake_process
+
+            launch = mock.AsyncMock(side_effect=fake_launch)
+            with mock.patch(
+                "swarmerz.orchestration.codex_appserver.asyncio.create_subprocess_exec",
+                launch,
+            ):
                 await client.start(spec, engine, stdout_path=root / "stdout.jsonl",
                                    stderr_path=root / "stderr.log", emit=lambda _: None)
                 result = await client.run(spec, engine)

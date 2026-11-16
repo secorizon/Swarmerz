@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .models import CommandSpec, EngineConfig
+from .storage import prepare_managed_environment
 
 
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -155,6 +156,10 @@ class CodexAppServer:
     ) -> None:
         # The normal hunter command is `codex exec ... PROMPT`; retain its pinned
         # executable and environment, but use the documented live RPC transport.
+        try:
+            prepare_managed_environment(spec.env)
+        except OSError as exc:
+            raise OSError(f"unable to prepare managed storage: {exc}") from exc
         exec_index = spec.argv.index("exec")
         argv = (
             *spec.argv[:exec_index], "app-server", "--disable", "apps",
