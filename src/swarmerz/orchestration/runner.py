@@ -861,6 +861,8 @@ class AuditRunner(SessionLifecycleMixin, HunterExecutionMixin, AdjudicationMixin
         parent_session_id: str,
         artifact_dir: Path,
         endpoint: OpenCodeEndpoint | None = None,
+        observation: dict[str, Any] | None = None,
+        observation_ready: asyncio.Event | None = None,
     ) -> dict[str, Any]:
         """Poll OpenCode's local session API until direct child sessions terminate."""
         started = time.monotonic()
@@ -933,6 +935,11 @@ class AuditRunner(SessionLifecycleMixin, HunterExecutionMixin, AdjudicationMixin
                 consecutive_errors = 0
                 status_fresh = True
                 write_json(artifact_dir / "worker-status.json", snapshot)
+                if observation is not None:
+                    observation["snapshot"] = snapshot
+                    observation["query_count"] = query_count
+                if observation_ready is not None:
+                    observation_ready.set()
             except (ConfigError, OSError) as exc:
                 consecutive_errors += 1
                 detail = str(exc)

@@ -30,6 +30,45 @@ from .opencode_server import IsolatedOpenCodeServer, attach_server
 from .protocol_support import engine_manifest as _engine_manifest
 
 
+_HARD_OPENCODE_PROVIDER_FAILURE_MARKERS = (
+    "provider.quota",
+    "insufficient account funds",
+    "provider.no-route",
+    "authentication failed",
+)
+_OPENCODE_PROVIDER_ERROR = re.compile(r"(?<![a-z0-9_.-])provider\.[a-z0-9_-]+")
+
+
+def _is_terminal_opencode_provider_failure(
+    result: dict[str, Any],
+    diagnostic: str,
+    *,
+    worker_status_observed: bool,
+    observed_workers: int,
+) -> bool:
+    """Return whether a failed parent cannot produce a usable worker swarm.
+
+    Quota, routing, and authentication failures retain their existing fail-fast
+    behavior. Other provider errors are terminal only after OpenCode's session
+    API has confirmed that the parent launched no direct child workers. This
+    prevents a broken parent stream from abandoning children that are still
+    doing useful work.
+    """
+    if result.get("status") not in {"failed", "failed_to_start"}:
+        return False
+    normalized = diagnostic.lower()
+    if any(
+        marker in normalized
+        for marker in _HARD_OPENCODE_PROVIDER_FAILURE_MARKERS
+    ):
+        return True
+    return bool(
+        worker_status_observed
+        and observed_workers == 0
+        and _OPENCODE_PROVIDER_ERROR.search(normalized)
+    )
+
+
 class HunterExecutionMixin:
     """Own hunter preparation, harness preflight, execution, and answer sealing."""
 
@@ -279,7 +318,38 @@ class HunterExecutionMixin:
             session_id: str | None = None
             worker_monitor: dict[str, Any] | None = None
             parent_forced_stop: dict[str, Any] | None = None
+            provider_failure = False
+            monitor_observation: dict[str, Any] = {}
+            monitor_observation_ready = asyncio.Event()
             execution_started = time.monotonic()
+
+            def provider_failure_monitor(
+                snapshot: dict[str, Any] | None = None,
+                *,
+                query_count: int = 0,
+            ) -> dict[str, Any]:
+                worker_snapshot = dict(snapshot) if isinstance(snapshot, dict) else {
+                    "parent_session_id": session_id,
+                    "expected_workers": engine.swarm_size,
+                    "observed_workers": 0,
+                    "terminal_workers": 0,
+                    "active_workers": 0,
+                    "all_workers_terminal": False,
+                    "outcomes": {},
+                    "active_titles": [],
+                    "output_tokens": 0,
+                    "latest_terminal_ms": 0,
+                    "earliest_created_ms": 0,
+                    "children": [],
+                }
+                return {
+                    "reason": "provider_failure",
+                    "wait_seconds": round(time.monotonic() - execution_started, 3),
+                    "query_count": query_count,
+                    "status_errors": [],
+                    "snapshot": worker_snapshot,
+                }
+
             execution_task = asyncio.create_task(self._execute_with_transport_retries(
                 engine,
                 spec,
@@ -307,6 +377,8 @@ class HunterExecutionMixin:
                     parent_session_id=session_id,
                     artifact_dir=artifact_dir,
                     endpoint=endpoint,
+                    observation=monitor_observation,
+                    observation_ready=monitor_observation_ready,
                 ))
 
             result: dict[str, Any] | None = None
@@ -321,17 +393,60 @@ class HunterExecutionMixin:
                         self._json_error_diagnostic(stdout_path) or "",
                         str(result.get("error") or ""),
                     )).lower()
-                    hard_provider_failure = any(
-                        marker in diagnostic
-                        for marker in (
-                            "provider.quota", "insufficient account funds",
-                            "provider.no-route", "authentication failed",
-                        )
+                    hard_provider_failure = _is_terminal_opencode_provider_failure(
+                        result,
+                        diagnostic,
+                        worker_status_observed=False,
+                        observed_workers=0,
                     )
-                    if hard_provider_failure and not monitor_task.done():
-                        monitor_task.cancel()
-                        with contextlib.suppress(asyncio.CancelledError):
-                            await monitor_task
+                    if (
+                        not hard_provider_failure
+                        and _OPENCODE_PROVIDER_ERROR.search(diagnostic)
+                        and not monitor_observation_ready.is_set()
+                    ):
+                        with contextlib.suppress(TimeoutError):
+                            await asyncio.wait_for(
+                                monitor_observation_ready.wait(),
+                                timeout=min(
+                                    max(float(self.config.opencode_worker_poll_seconds), 0.1),
+                                    5.0,
+                                ),
+                            )
+                    observed_snapshot = monitor_observation.get("snapshot")
+                    worker_status_observed = (
+                        monitor_observation_ready.is_set()
+                        and isinstance(observed_snapshot, dict)
+                    )
+                    observed_workers = (
+                        int(observed_snapshot.get("observed_workers") or 0)
+                        if isinstance(observed_snapshot, dict)
+                        else 0
+                    )
+                    provider_failure = _is_terminal_opencode_provider_failure(
+                        result,
+                        diagnostic,
+                        worker_status_observed=worker_status_observed,
+                        observed_workers=observed_workers,
+                    )
+                    if provider_failure:
+                        if monitor_task.done():
+                            # Retrieve a simultaneous monitor result so a rare
+                            # monitor exception is not silently discarded.
+                            monitor_task.result()
+                        else:
+                            monitor_task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await monitor_task
+                        worker_monitor = provider_failure_monitor(
+                            observed_snapshot if isinstance(observed_snapshot, dict) else None,
+                            query_count=int(monitor_observation.get("query_count") or 0),
+                        )
+                        write_json(artifact_dir / "worker-monitor.json", worker_monitor)
+                        if observed_workers == 0:
+                            self._emit(
+                                f"[{engine.id}] parent provider failed before launching "
+                                "workers; skipping the worker timeout"
+                            )
                     else:
                         worker_monitor = await monitor_task
                 else:
@@ -477,9 +592,12 @@ class HunterExecutionMixin:
                 for item in (initial_diagnostic, json_diagnostic, result.get("error"))
                 if item
             ).lower()
-            provider_failure = any(
+            provider_failure = provider_failure or any(
                 marker in diagnostic_text
-                for marker in ("provider.quota", "insufficient account funds", "provider.no-route", "auth")
+                for marker in (
+                    "provider.quota", "insufficient account funds",
+                    "provider.no-route", "auth",
+                )
             )
             needs_finalize = False
 
@@ -487,24 +605,18 @@ class HunterExecutionMixin:
                 if not session_id:
                     result["artifact_error"] = "OpenCode returned no parent session ID; worker swarm cannot be verified"
                 elif provider_failure:
-                    result["worker_monitor"] = {
-                        "reason": "provider_failure",
-                        "wait_seconds": 0,
-                        "query_count": 0,
-                        "status_errors": [],
-                        "snapshot": {
-                            "parent_session_id": session_id,
-                            "expected_workers": engine.swarm_size,
-                            "observed_workers": 0,
-                            "terminal_workers": 0,
-                            "active_workers": 0,
-                            "all_workers_terminal": False,
-                            "outcomes": {},
-                            "active_titles": [],
-                            "children": [],
-                        },
-                    }
+                    if worker_monitor is None or worker_monitor.get("reason") != "provider_failure":
+                        prior_snapshot = (
+                            worker_monitor.get("snapshot")
+                            if isinstance(worker_monitor, dict)
+                            and isinstance(worker_monitor.get("snapshot"), dict)
+                            else None
+                        )
+                        worker_monitor = provider_failure_monitor(prior_snapshot)
+                        write_json(artifact_dir / "worker-monitor.json", worker_monitor)
+                    result["worker_monitor"] = worker_monitor
                     result["worker_contract_verified"] = False
+                    result["fanout_evidence"] = "unverified"
                 else:
                     if (
                         spec.artifact_path

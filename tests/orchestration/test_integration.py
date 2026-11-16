@@ -19,6 +19,9 @@ from unittest import mock
 from pathlib import Path
 
 from swarmerz.orchestration.config import load_config
+from swarmerz.orchestration.hunter_execution import (
+    _is_terminal_opencode_provider_failure,
+)
 from swarmerz.orchestration.models import CommandSpec, ConfigError, StorageConfig
 from swarmerz.orchestration.opencode_permissions import OpenCodeEndpoint
 from swarmerz.orchestration.runner import (
@@ -29,6 +32,34 @@ from swarmerz.review import chat
 
 
 class IntegrationTests(unittest.TestCase):
+    def test_generic_provider_failure_requires_a_verified_empty_worker_set(self) -> None:
+        failed = {"status": "failed"}
+        diagnostic = "provider.internal: upstream gRPC error"
+        self.assertFalse(_is_terminal_opencode_provider_failure(
+            failed,
+            diagnostic,
+            worker_status_observed=False,
+            observed_workers=0,
+        ))
+        self.assertTrue(_is_terminal_opencode_provider_failure(
+            failed,
+            diagnostic,
+            worker_status_observed=True,
+            observed_workers=0,
+        ))
+        self.assertFalse(_is_terminal_opencode_provider_failure(
+            failed,
+            diagnostic,
+            worker_status_observed=True,
+            observed_workers=1,
+        ))
+        self.assertTrue(_is_terminal_opencode_provider_failure(
+            failed,
+            "provider.no-route: model unavailable",
+            worker_status_observed=False,
+            observed_workers=0,
+        ))
+
     def test_baseline_first_and_secondary_confirmation_gate_findings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1078,6 +1109,153 @@ class IntegrationTests(unittest.TestCase):
             self.assertEqual((root / "two.count").read_text(), "1")
             self.assertEqual(len(list((run_dir / "analysis" / "attempts").iterdir())), 1)
             self.assertFalse((run_dir / "workspaces").exists())
+
+    def test_native_opencode_fails_fast_when_provider_dies_before_worker_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_opencode = root / "opencode"
+            fake_opencode.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!{sys.executable}
+                    import json, pathlib, sys
+
+                    args = sys.argv[1:]
+                    cwd = pathlib.Path.cwd()
+                    parent = "parent-" + cwd.name
+                    if args == ["--version"]:
+                        print("opencode v2.0.21")
+                    elif args and args[0] == "run" and "--session" in args:
+                        pathlib.Path({str(root)!r}, "finalize-called").write_text("called")
+                        raise SystemExit("finalization must not run after a provider failure")
+                    elif args and args[0] == "run":
+                        print(json.dumps({{"type": "step_start", "sessionID": parent}}), flush=True)
+                        print(json.dumps({{
+                            "type": "error",
+                            "sessionID": parent,
+                            "error": {{
+                                "type": "provider.internal",
+                                "message": "gRPC error: request rejected"
+                            }}
+                        }}), flush=True)
+                        raise SystemExit(1)
+                    else:
+                        raise SystemExit("unexpected fake OpenCode arguments: " + repr(args))
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_opencode.chmod(0o755)
+
+            config_path = root / "swarm.toml"
+            config_path.write_text(
+                textwrap.dedent(
+                    f"""
+                    schema_version = 1
+                    output_root = "{root / 'runs'}"
+                    minimum_answers = 2
+                    opencode_worker_timeout_seconds = 2
+                    opencode_worker_poll_seconds = 1
+                    opencode_finalize_timeout_seconds = 2
+
+                    [[hunters]]
+                    id = "grok"
+                    harness = "opencode"
+                    harness_version = "2.0.21"
+                    provider = "xai"
+                    model = "grok-test"
+                    reasoning_effort = "default"
+                    supported_efforts = ["default"]
+                    timeout_seconds = 5
+                    workers = 2
+                    subagents = 2
+                    pass_env = ["FAKE_OPENCODE_KEY"]
+
+                    [[hunters]]
+                    id = "control"
+                    harness = "command"
+                    harness_version = "test"
+                    provider = "test"
+                    model = "test"
+                    reasoning_effort = "low"
+                    supported_efforts = ["low"]
+                    workers = 2
+                    command = ["/bin/false"]
+
+                    [analyzer]
+                    id = "unused-analyzer"
+                    harness = "command"
+                    harness_version = "test"
+                    provider = "test"
+                    model = "test"
+                    reasoning_effort = "low"
+                    supported_efforts = ["low"]
+                    command = ["/bin/false"]
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            progress: list[str] = []
+            test_env = {
+                "PATH": f"{root}:{os.environ.get('PATH', '')}",
+                "FAKE_OPENCODE_KEY": "test-only",
+            }
+
+            class FakeServer:
+                endpoint = OpenCodeEndpoint("http://127.0.0.1:40001", "test-password")
+                stderr_path = root / "fake-server.stderr.log"
+
+                async def wait_ready(self, endpoint: OpenCodeEndpoint) -> None:
+                    assert endpoint.directory is not None
+
+                async def stop(self) -> None:
+                    return None
+
+            async def fake_start(*_args: object, **_kwargs: object) -> FakeServer:
+                return FakeServer()
+
+            @contextlib.asynccontextmanager
+            async def no_op_round_slot(_emit: object, _lock_root: object = None):
+                yield
+
+            with mock.patch.dict(os.environ, test_env), mock.patch(
+                "swarmerz.orchestration.runner.list_worker_sessions",
+                return_value={"data": []},
+            ) as worker_sessions, mock.patch(
+                "swarmerz.orchestration.runner.IsolatedOpenCodeServer.start",
+                side_effect=fake_start,
+            ), mock.patch(
+                "swarmerz.orchestration.runner._opencode_round_slot", no_op_round_slot
+            ):
+                run_dir = asyncio.run(AuditRunner(
+                    load_config(config_path),
+                    "provider failure lifecycle",
+                    session_id="provider-failure",
+                    round_id="first",
+                    progress=progress.append,
+                ).run())
+
+            manifest = json.loads((run_dir / "manifest.json").read_text())
+            grok_result = next(
+                item for item in manifest["hunter_results"] if item["hunter_id"] == "grok"
+            )
+            self.assertEqual(grok_result["status"], "failed")
+            self.assertFalse(grok_result["answer_sealed"])
+            self.assertFalse(grok_result["worker_contract_verified"])
+            self.assertEqual(grok_result["worker_monitor"]["reason"], "provider_failure")
+            self.assertEqual(
+                grok_result["worker_monitor"]["snapshot"]["observed_workers"], 0
+            )
+            self.assertIn("provider.internal", grok_result["diagnostic"])
+            self.assertNotIn("recovery", grok_result)
+            self.assertFalse((root / "finalize-called").exists())
+            self.assertTrue((run_dir / "hunters" / "grok" / "worker-monitor.json").is_file())
+            worker_sessions.assert_called()
+            self.assertTrue(any(
+                "parent provider failed before launching workers" in item
+                for item in progress
+            ))
 
     def test_native_opencode_monitors_workers_and_replaces_provisional_answer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
