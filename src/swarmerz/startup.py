@@ -16,6 +16,7 @@ from prompt_toolkit.widgets import Frame
 from .branding import render_brand_header
 from .backend import MissionRecord
 from .keybar import render_keybar, terminal_columns
+from .terminal import run_tui_application
 from .themes import initial_theme_name, next_theme_name, style_for
 
 
@@ -86,7 +87,7 @@ class StartupApp:
         )
 
     async def run(self) -> StartupRequest | None:
-        await self.application.run_async()
+        await run_tui_application(self.application)
         return self.result
 
     @property

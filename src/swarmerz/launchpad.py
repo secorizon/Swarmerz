@@ -21,6 +21,7 @@ from .branding import render_brand_header
 from .clipboard import copy_to_clipboard
 from .keybar import render_keybar, terminal_columns
 from .models import HunterSpec
+from .terminal import run_tui_application
 from .themes import initial_theme_name, next_theme_name, style_for
 
 
@@ -162,7 +163,7 @@ class LaunchpadApp:
         return ("mode", "context", "session", "instruction")
 
     async def run(self) -> LaunchRequest | None:
-        await self.application.run_async()
+        await run_tui_application(self.application)
         return self.result
 
     def _bindings(self) -> KeyBindings:

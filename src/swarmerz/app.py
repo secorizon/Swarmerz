@@ -33,6 +33,7 @@ from .models import (
     MissionState,
 )
 from .keybar import render_keybar
+from .terminal import run_tui_application
 from .themes import initial_theme_name, next_theme_name, style_for, theme_names
 from .workspace import WorkspaceControl
 
@@ -237,7 +238,7 @@ class SwarmerzApp:
         if self.state.finished_at is None:
             self._ticker_task = asyncio.create_task(self._ticker())
         try:
-            await self.application.run_async()
+            await run_tui_application(self.application)
         finally:
             if self._ticker_task:
                 self._ticker_task.cancel()
