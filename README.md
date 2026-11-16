@@ -25,9 +25,9 @@ not as a product requirement or capacity ceiling.
  │  ━━━━━━━ 4/4     54.9k ││01:14:23  local-b   tool shell   ││ ◆ FREEZE ◆ BASE      │
  ││ LOCAL-B     BLOCKED   ││01:14:31  local-b   permission   ││ ◆ HUNT   ● QUORUM    │
  │  ━━━━━── 3/4     35.9k ││01:14:36  control   delivered    ││ ○ JUDGE  ○ VERIFY    │
- ││ HOSTED-C    HUNTING   ││                                    ││ ○ SEAL · sealed 1/5  │
- │  ━━━──── 2/4     18.8k ││                                    ││ focus local-a        │
- └────────────────────────┘└──────────────────────────────────┘└──────────────────────┘
+ ││ HOSTED-C    HUNTING   ││                                 ││ ○ SEAL · sealed 1/5  │
+ │  ━━━──── 2/4     18.8k ││                                 ││ focus local-a        │
+ └────────────────────────┘└─────────────────────────────────┘└──────────────────────┘
   COMMAND  › /to local-b finish the provider sweep and preserve evidence
   F1 map  F2 signal  F3 reports  F4 synthesis  F5 mission  F9 theme  Tab focus  Ctrl-Q exit
 ```
