@@ -45,6 +45,7 @@ class RunResult:
     hunter_outcomes: tuple[HunterOutcome, ...] = ()
     review_command: str = ""
     historical: bool = False
+    analyzer_model: str = ""
 
 
 @dataclass(frozen=True)
@@ -165,6 +166,7 @@ class SwarmerzBackend:
             degraded=bool(manifest.get("degraded")),
             hunter_outcomes=_hunter_outcomes(manifest),
             review_command=review_command,
+            analyzer_model=config.analyzer.effective_model,
         )
 
     async def send(self, message: str, target: str | None = None) -> list[str]:
@@ -182,18 +184,18 @@ class SwarmerzBackend:
 
     def open_review(self) -> str:
         if not self._review_argv:
-            return "Codex follow-up is unavailable for this analyzer."
+            return "Judge follow-up is unavailable for this analyzer."
         argv = list(self._review_argv)
         if self._review_started:
             argv.append("--resume")
         try:
             result = subprocess.run(argv, check=False)
         except OSError as exc:
-            return f"Could not open Codex review: {exc}"
+            return f"Could not open judge review: {exc}"
         if result.returncode == 0:
             self._review_started = True
-            return "Codex review closed. Type /chat again to resume it."
-        return f"Codex review exited with status {result.returncode}."
+            return "Judge review closed. Type /chat again to resume it."
+        return f"Judge review exited with status {result.returncode}."
 
 
 class HistoricalBackend:
@@ -245,6 +247,16 @@ class HistoricalBackend:
 
         review_command = ""
         analyzer = manifest.get("analyzer")
+        analyzer_model = (
+            str(
+                analyzer.get("effective_model")
+                or analyzer.get("model_snapshot")
+                or analyzer.get("requested_model")
+                or "judge"
+            )
+            if isinstance(analyzer, dict)
+            else "judge"
+        )
         if (
             manifest.get("status") == "completed"
             and isinstance(analyzer, dict)
@@ -262,6 +274,7 @@ class HistoricalBackend:
             hunter_outcomes=_hunter_outcomes(manifest),
             review_command=review_command,
             historical=True,
+            analyzer_model=analyzer_model,
         )
 
     async def send(self, message: str, target: str | None = None) -> list[str]:
@@ -275,18 +288,18 @@ class HistoricalBackend:
 
     def open_review(self) -> str:
         if not self._review_argv:
-            return "Codex follow-up is unavailable for this stored mission."
+            return "Judge follow-up is unavailable for this stored mission."
         argv = list(self._review_argv)
         if self._review_started:
             argv.append("--resume")
         try:
             result = subprocess.run(argv, check=False)
         except OSError as exc:
-            return f"Could not open Codex review: {exc}"
+            return f"Could not open judge review: {exc}"
         if result.returncode == 0:
             self._review_started = True
-            return "Codex review closed. Type /chat again to resume it."
-        return f"Codex review exited with status {result.returncode}."
+            return "Judge review closed. Type /chat again to resume it."
+        return f"Judge review exited with status {result.returncode}."
 
 
 class DemoBackend:
@@ -380,7 +393,7 @@ class DemoBackend:
         return "demo transports ready" if self.active else "demo complete"
 
     def open_review(self) -> str:
-        return "Codex follow-up is unavailable in demo mode."
+        return "Judge follow-up is unavailable in demo mode."
 
 
 def _read_json(path: Path) -> dict[str, object]:

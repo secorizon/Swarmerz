@@ -290,7 +290,7 @@ def main(argv: list[str] | None = None) -> int:
             state.notice = startup_warning
         asyncio.run(SwarmerzApp(state, backend_factory).run())
         if state.review_command:
-            print("Codex follow-up (open in another terminal tab):")
+            print("Judge follow-up (open in another terminal tab):")
             print(state.review_command)
         return 0 if state.phase.value in {"complete", "degraded"} else 1
     except (SwarmerzConfigError, ValueError, OSError) as exc:

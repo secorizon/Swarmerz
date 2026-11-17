@@ -384,7 +384,7 @@ class LaunchpadApp:
         for spec in self.specs:
             rows.extend([
                 ("class:accent", " ◆ "),
-                ("class:soft", _clip(spec.id.upper(), 9).ljust(10)),
+                ("class:soft", _clip(spec.label.upper(), 9).ljust(10)),
                 ("class:soft", _clip(spec.model, 15).ljust(16)),
                 ("class:muted", f"×{spec.workers} "),
                 ("class:violet", "auto" if spec.effort == "default" else spec.effort),

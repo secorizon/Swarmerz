@@ -127,7 +127,7 @@ quality from process status alone.
 | `F6` | Copy the workspace selection, or the full current workspace without a selection. |
 | `F7` | Compatibility alias for `F6`. |
 | `Ctrl-C` | Copy when the workspace selection has focus. |
-| `F8` | Open the Codex follow-up view when available. |
+| `F8` | Open the judge follow-up view when available. |
 | `F9` | Cycle themes. |
 | `Tab` / `Shift-Tab` | Focus the next or previous hunter. |
 | `Ctrl-Q` | Exit only after work reaches a terminal state. |
@@ -140,7 +140,7 @@ across the entire screen grid.
 | Command | Action |
 |---|---|
 | Plain text or `/all MESSAGE` | Steer active parents and unfinished workers. |
-| `/to ID MESSAGE` | Steer one hunter swarm. |
+| `/to ID MESSAGE` | Steer one hunter swarm, or resume a recoverable harness session. |
 | `/wrap [ID]` | Ask one or all swarms to consolidate and finish. |
 | `/status` | Show steering readiness. |
 | `/focus ID` | Focus a hunter. |
@@ -148,8 +148,18 @@ across the entire screen grid.
 | `/view activity\|reports\|synthesis\|mission\|review\|help` | Change workspace view. |
 | `/theme [NAME]` | List or choose a theme. |
 | `/clear` | Clear the local signal rail only. |
-| `/chat` | Open or resume a completed native-Codex review. |
+| `/chat` | Open or resume a completed review when the judge uses native Codex. |
 | `/quit` or `/exit` | Exit only after the mission is terminal. |
 
 Steering is an instruction to a running agent, not a forced process termination or a guarantee of
 immediate completion.
+
+A failed native Codex hunter or verified native OpenCode hunter remains `RECOVERABLE` only while
+another hunter is still open. A targeted `/to ID MESSAGE` starts a follow-up on the same thread or
+session and in the same workspace. Broadcast commands exclude recoverable hunters, so an operator
+must make the retry explicit. Failures that never established a safe resumable session are
+terminal; Cline and custom command adapters do not currently expose this recovery path.
+
+The deck displays Codex-backed hunters by configured model name, such as `DAYBREAK` or
+`GPT-5.6-SOL`. Commands continue to use the stable hunter ID shown in brackets, such as
+`/to codex continue`.

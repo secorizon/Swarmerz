@@ -50,7 +50,7 @@ def _level(message: str) -> EventLevel:
         "timed out", "timeout reached", "status is slow", "degraded", "partial",
         "warning", "rejected child", "unavailable", "missing hunters",
         "workers blocked", "unable to reject child", "repeatedly requested additional access",
-        "permission request(s) pending",
+        "permission request(s) pending", "recovery available",
     )):
         return EventLevel.WARNING
     if any(token in lowered for token in (
@@ -86,7 +86,7 @@ def ingest_progress(state: MissionState, raw: str) -> None:
             source = hunter.spec.id if hunter else source_label.split("/", 1)[0]
             if hunter:
                 _update_hunter(hunter, body, live=live)
-                if hunter.phase is HunterPhase.BLOCKED:
+                if hunter.phase in {HunterPhase.BLOCKED, HunterPhase.RECOVERABLE}:
                     state.notice = f"ATTENTION · {hunter.spec.id}: {_notice_text(body)}"
 
     # Live output contains model-authored text and command output. Lifecycle
@@ -165,9 +165,9 @@ def _update_hunter(hunter: HunterState, body: str, *, live: bool = False) -> Non
         hunter.phase = HunterPhase.SEALED
         hunter.report_ready = True
         hunter.detail = (
-            "sealed evidence ready for Codex (degraded worker coverage)"
+            "sealed evidence ready for the judge (degraded worker coverage)"
             if "(degraded)" in lowered
-            else "sealed evidence ready for Codex"
+            else "sealed evidence ready for the judge"
         )
         return
     worker_match = _WORKERS.search(body)
@@ -196,6 +196,13 @@ def _update_hunter(hunter: HunterState, body: str, *, live: bool = False) -> Non
     )):
         hunter.phase = HunterPhase.BLOCKED
         hunter.detail = body
+    elif "recovery available" in lowered:
+        hunter.phase = HunterPhase.RECOVERABLE
+        hunter.active_workers = 0
+        hunter.detail = body
+    elif "resuming recoverable" in lowered:
+        hunter.phase = HunterPhase.HUNTING
+        hunter.detail = "resuming the same harness session from operator instruction"
     elif "resuming opencode session" in lowered or "consolidat" in lowered:
         hunter.phase = HunterPhase.CONSOLIDATING
         hunter.detail = "reconciling worker evidence"

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 
 from .codex_appserver import CodexAppServer
@@ -39,6 +40,8 @@ class LiveControl:
         self.opencode: dict[str, OpenCodeTarget] = {}
         self.codex: dict[str, CodexAppServer] = {}
         self.active: set[str] = set()
+        self.recoverable: set[str] = set()
+        self._recovery_instructions: dict[str, asyncio.Queue[str]] = {}
         self.started: set[str] = set()
         self.labels = labels or {}
 
@@ -47,11 +50,48 @@ class LiveControl:
 
     def register_opencode(self, hunter_id: str, endpoint: OpenCodeEndpoint) -> None:
         self.opencode[hunter_id] = OpenCodeTarget(endpoint)
+        self.recoverable.discard(hunter_id)
+        self._recovery_instructions.pop(hunter_id, None)
         self.active.add(hunter_id)
 
     def register_codex(self, hunter_id: str, client: CodexAppServer) -> None:
         self.codex[hunter_id] = client
+        self.recoverable.discard(hunter_id)
+        self._recovery_instructions.pop(hunter_id, None)
         self.active.add(hunter_id)
+
+    def mark_recoverable(self, hunter_id: str) -> None:
+        if hunter_id not in self.codex and hunter_id not in self.opencode:
+            raise RuntimeError(f"{hunter_id}: no resumable harness session")
+        self.active.discard(hunter_id)
+        self.recoverable.add(hunter_id)
+        self._recovery_instructions.setdefault(
+            hunter_id, asyncio.Queue(maxsize=1)
+        )
+
+    def mark_resuming(self, hunter_id: str) -> None:
+        if hunter_id not in self.recoverable:
+            raise RuntimeError(f"{hunter_id}: harness session is not recoverable")
+        self.recoverable.discard(hunter_id)
+        self.active.add(hunter_id)
+
+    def recovery_window_open(self, hunter_id: str) -> bool:
+        return any(active_id != hunter_id for active_id in self.active)
+
+    def has_pending_recovery(self, hunter_id: str) -> bool:
+        queue = self._recovery_instructions.get(hunter_id)
+        return queue is not None and not queue.empty()
+
+    async def next_recovery(
+        self, hunter_id: str, *, timeout_seconds: float = 0.5
+    ) -> str | None:
+        queue = self._recovery_instructions.get(hunter_id)
+        if queue is None:
+            raise RuntimeError(f"{hunter_id}: recovery queue is unavailable")
+        try:
+            return await asyncio.wait_for(queue.get(), timeout=timeout_seconds)
+        except TimeoutError:
+            return None
 
     def set_opencode_session(self, hunter_id: str, session_id: str) -> None:
         if hunter_id in self.opencode and self.opencode[hunter_id].session_id is None:
@@ -63,20 +103,28 @@ class LiveControl:
 
     def finished(self, hunter_id: str) -> None:
         self.active.discard(hunter_id)
+        self.recoverable.discard(hunter_id)
+        self._recovery_instructions.pop(hunter_id, None)
         self.started.discard(hunter_id)
         if hunter_id in self.opencode:
             self.opencode[hunter_id].active = False
         self.codex.pop(hunter_id, None)
 
     def status(self) -> str:
-        if not self.active:
+        visible = self.active | self.recoverable
+        if not visible:
             return "No hunters are active."
         parts = []
-        for hunter_id in sorted(self.active):
+        for hunter_id in sorted(visible):
             label = self.labels.get(hunter_id, hunter_id)
             if label != hunter_id:
                 label = f"{label} ({hunter_id})"
-            if hunter_id in self.opencode:
+            if hunter_id in self.recoverable:
+                harness = "Codex" if hunter_id in self.codex else "OpenCode"
+                parts.append(
+                    f"{label}: {harness} RECOVERABLE; use /to {hunter_id} MESSAGE"
+                )
+            elif hunter_id in self.opencode:
                 target = self.opencode[hunter_id]
                 parts.append(f"{label}: OpenCode {'ready' if target.session_id else 'starting'}")
             elif hunter_id in self.codex:
@@ -94,6 +142,23 @@ class LiveControl:
         selected = [target_id] if target_id else sorted(self.active)
         outcomes: list[str] = []
         for hunter_id in selected:
+            if hunter_id in self.recoverable:
+                queue = self._recovery_instructions.get(hunter_id)
+                if queue is None:
+                    outcomes.append(f"{hunter_id}: recovery transport unavailable")
+                    continue
+                try:
+                    queue.put_nowait(message)
+                    harness = "Codex thread" if hunter_id in self.codex else "OpenCode session"
+                    outcomes.append(
+                        f"{hunter_id}: recovery instruction queued for the same {harness}"
+                    )
+                except asyncio.QueueFull:
+                    outcomes.append(
+                        f"{hunter_id}: recovery not queued "
+                        "(a recovery instruction is already queued)"
+                    )
+                continue
             if hunter_id not in self.active:
                 outcomes.append(f"{hunter_id}: not active")
                 continue

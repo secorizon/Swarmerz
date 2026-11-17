@@ -18,6 +18,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Callable
 
+from ..models import display_model_name
 from .adapters import (
     build_auth_probe_command,
     build_probe_command,
@@ -84,7 +85,11 @@ _SAFE_ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,95}$")
 
 
 def _hunter_progress_name(engine: EngineConfig) -> str:
-    return engine.effective_model if engine.provider == "ollama" else engine.id
+    if engine.provider == "ollama":
+        return engine.effective_model
+    if engine.harness in {"codex", "codex-exec"} and not engine.command:
+        return display_model_name(engine.effective_model)
+    return engine.id
 
 
 _PROVENANCE_CLASSES = {
@@ -813,14 +818,96 @@ class AuditRunner(SessionLifecycleMixin, HunterExecutionMixin, AdjudicationMixin
         ):
             started = time.monotonic()
             client = CodexAppServer()
+            display_role = _hunter_progress_name(engine)
             try:
+                longest_peer_runtime = max(
+                    (
+                        peer.timeout_seconds
+                        + (
+                            (
+                                peer.worker_timeout_seconds
+                                or self.config.opencode_worker_timeout_seconds
+                            )
+                            + self.config.opencode_finalize_timeout_seconds
+                            if peer.harness == "opencode" and not peer.command
+                            else 0
+                        )
+                    )
+                    for peer in self.config.hunters
+                )
                 await client.start(
                     spec, engine, stdout_path=stdout_path, stderr_path=stderr_path,
-                    emit=lambda message: self._emit(f"[{role}/live] {message}"),
+                    emit=lambda message: self._emit(f"[{display_role}/live] {message}"),
                     resource_limiter=self._resource_limiter,
+                    runtime_seconds=(
+                        longest_peer_runtime + engine.timeout_seconds + 300
+                    ),
                 )
                 self.live_control.register_codex(role, client)
                 result = await client.run(spec, engine)
+                initial_failure = dict(result) if result.get("status") != "completed" else None
+                recovery_attempts: list[dict[str, Any]] = []
+                while (
+                    result.get("status") != "completed"
+                    and not result.get("answer_contract_valid")
+                    and client.thread_id is not None
+                    and (
+                        self.live_control.recovery_window_open(role)
+                        or self.live_control.has_pending_recovery(role)
+                    )
+                ):
+                    self.live_control.mark_recoverable(role)
+                    detail = str(result.get("error") or result.get("status") or "failed")
+                    self._emit(
+                        f"[{display_role}] Codex turn failed; recovery available while other "
+                        f"hunters run. Use /to {role} MESSAGE to resume the same thread. "
+                        f"Detail: {detail[:240]}"
+                    )
+                    followup: str | None = None
+                    while (
+                        self.live_control.recovery_window_open(role)
+                        or self.live_control.has_pending_recovery(role)
+                    ):
+                        followup = await self.live_control.next_recovery(role)
+                        if followup is not None:
+                            break
+                    if followup is None:
+                        break
+                    self.live_control.mark_resuming(role)
+                    self._emit(
+                        f"[{display_role}] resuming recoverable Codex thread from targeted "
+                        "operator instruction"
+                    )
+                    attempt_started = time.monotonic()
+                    try:
+                        result = await client.run(spec, engine, prompt=followup)
+                    except (RuntimeError, TimeoutError, OSError, ValueError) as exc:
+                        result = {
+                            "status": (
+                                "timed_out" if isinstance(exc, TimeoutError) else "failed"
+                            ),
+                            "exit_code": None,
+                            "timed_out": isinstance(exc, TimeoutError),
+                            "error": str(exc),
+                        }
+                    result["duration_seconds"] = round(
+                        time.monotonic() - attempt_started, 3
+                    )
+                    recovery_attempts.append({
+                        "instruction_sha256": hashlib.sha256(
+                            followup.encode("utf-8")
+                        ).hexdigest(),
+                        **result,
+                    })
+                if recovery_attempts:
+                    result = dict(result)
+                    result["initial_failure"] = initial_failure
+                    result["recovery_attempts"] = recovery_attempts
+                    result["recovery_count"] = len(recovery_attempts)
+                    result["resumed_after_failure"] = bool(
+                        result.get("status") == "completed"
+                        or result.get("answer_contract_valid")
+                    )
                 result["duration_seconds"] = round(time.monotonic() - started, 3)
                 result["codex_thread_id"] = client.thread_id
                 return result
@@ -1305,11 +1392,12 @@ class AuditRunner(SessionLifecycleMixin, HunterExecutionMixin, AdjudicationMixin
         artifact_dir: Path,
         session_id: str,
         endpoint: OpenCodeEndpoint | None,
+        log_stem: str = "finalize",
     ) -> dict[str, Any]:
         if spec.artifact_path is None:
             raise ConfigError("OpenCode finalization requires an answer artifact path")
-        stdout_path = artifact_dir / "finalize.stdout.jsonl"
-        stderr_path = artifact_dir / "finalize.stderr.log"
+        stdout_path = artifact_dir / f"{log_stem}.stdout.jsonl"
+        stderr_path = artifact_dir / f"{log_stem}.stderr.log"
         provider_retry_limit = 1
         attempts: list[dict[str, Any]] = []
         result: dict[str, Any] = {}

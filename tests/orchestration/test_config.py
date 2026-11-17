@@ -75,6 +75,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(by_id["kimi"].model, "k3.1-pro")
         self.assertEqual(by_id["codex"].harness_version, "0.169.0")
         self.assertEqual(by_id["codex"].model, "gpt-daybreak-blue-latest")
+        self.assertEqual(_hunter_progress_name(by_id["codex"]), "daybreak")
         self.assertEqual(hosted.analyzer.harness_version, "0.169.0")
         self.assertEqual(hosted.analyzer.model, "gpt-5.6-sol")
         self.assertFalse(hosted.analyzer.baseline_first)

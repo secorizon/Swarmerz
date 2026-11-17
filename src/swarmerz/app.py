@@ -31,6 +31,7 @@ from .models import (
     HunterPhase,
     MissionPhase,
     MissionState,
+    display_model_name,
 )
 from .keybar import render_keybar
 from .terminal import run_tui_application
@@ -54,7 +55,7 @@ _PHASE_ORDER = (
 
 _FOOTER_FULL = [
     ("F1", "map"), ("F2", "signal"), ("F3", "reports"), ("F4", "synthesis"),
-    ("F5", "mission"), ("F6", "copy"), ("F8", "Codex chat"),
+    ("F5", "mission"), ("F6", "copy"), ("F8", "judge chat"),
     ("F9", "theme"), ("PgUp/PgDn", "scroll"), ("Tab", "focus"),
     ("Ctrl-B", "broadcast"), ("Ctrl-T", "target"), ("Ctrl-Q", "exit"),
 ]
@@ -270,6 +271,8 @@ class SwarmerzApp:
         self.state.run_dir = result.run_dir
         self.state.final_answer = result.final_answer
         self.state.review_command = result.review_command
+        if result.analyzer_model:
+            self.state.analyzer_model = result.analyzer_model
         self._reconcile_hunters(result)
         if result.status == "completed":
             self.state.phase = (
@@ -283,13 +286,13 @@ class SwarmerzApp:
             if result.historical:
                 self.state.notice = (
                     "Stored mission loaded read-only. F3 reports; F4 synthesis; "
-                    "F8 Codex follow-up."
+                    "F8 judge follow-up."
                     if self.state.review_command
                     else "Stored mission loaded read-only. F3 reports; F4 synthesis."
                 )
             else:
                 self.state.notice = (
-                    "Mission sealed. F4 opens synthesis; F8 opens Codex follow-up; Ctrl-Q exits."
+                    "Mission sealed. F4 opens synthesis; F8 opens judge follow-up; Ctrl-Q exits."
                     if self.state.review_command
                     else "Mission sealed. F4 opens synthesis; Ctrl-Q exits."
                 )
@@ -328,9 +331,9 @@ class SwarmerzApp:
                 hunter.report_ready = True
                 hunter.active_workers = 0
                 hunter.detail = (
-                    "sealed evidence ready for Codex (degraded worker coverage)"
+                    "sealed evidence ready for the judge (degraded worker coverage)"
                     if outcome.degraded
-                    else "sealed evidence ready for Codex"
+                    else "sealed evidence ready for the judge"
                 )
             elif outcome.blocked:
                 hunter.phase = HunterPhase.BLOCKED
@@ -598,12 +601,12 @@ class SwarmerzApp:
             return
         if command == "/chat":
             if self.backend.active:
-                self.state.notice = "Codex follow-up is available after the mission is sealed."
+                self.state.notice = "Judge follow-up is available after the mission is sealed."
                 return
             if not self.state.review_command:
-                self.state.notice = "Codex follow-up is unavailable for this analyzer."
+                self.state.notice = "Judge follow-up is unavailable for this analyzer."
                 return
-            self.state.notice = "Opening Codex review; the deck will return when the chat closes."
+            self.state.notice = "Opening judge review; the deck will return when the chat closes."
             self.application.invalidate()
             self.state.notice = await run_in_terminal(self.backend.open_review)
             self.application.invalidate()
@@ -654,7 +657,7 @@ class SwarmerzApp:
             marker = "▌" if is_selected else "│"
             fragments.extend([
                 ("class:selected.marker" if is_selected else "class:muted", marker + " "),
-                (base + " class:soft", _clip(hunter.spec.id.upper(), 11).ljust(12)),
+                (base + " class:soft", _clip(hunter.spec.label.upper(), 11).ljust(12)),
                 (f"class:phase.{hunter.phase.value}", hunter.phase.value.upper()),
                 ("", "\n"),
                 (base + " class:muted", "  "),
@@ -708,35 +711,37 @@ class SwarmerzApp:
         report = self.state.reports.get(selected.spec.id)
         if not report:
             return FormattedText([
-                ("class:report.heading", f"{selected.spec.id.upper()} REPORT\n\n"),
+                ("class:report.heading", f"{selected.spec.label.upper()} REPORT\n\n"),
                 ("class:muted", "No sealed standalone report has arrived yet.\n\n"),
                 ("class:soft", selected.last_event or selected.detail),
             ])
         return FormattedText([
-            ("class:report.heading", f"{selected.spec.id.upper()}  //  SEALED REPORT\n\n"),
+            ("class:report.heading", f"{selected.spec.label.upper()}  //  SEALED REPORT\n\n"),
             ("class:soft", report),
         ])
 
     def _render_synthesis(self) -> FormattedText:
+        judge = display_model_name(self.state.analyzer_model).upper()
         if not self.state.final_answer:
             return FormattedText([
-                ("class:report.heading", "CODEX SYNTHESIS\n\n"),
+                ("class:report.heading", f"{judge} SYNTHESIS\n\n"),
                 ("class:muted", "The blind adjudication has not completed yet.\n"),
                 ("class:soft", "Swarmerz will place the final standalone answer here."),
             ])
         return FormattedText([
-            ("class:report.heading", "CODEX SYNTHESIS  //  FINAL\n\n"),
+            ("class:report.heading", f"{judge} SYNTHESIS  //  FINAL\n\n"),
             ("class:soft", self.state.final_answer),
         ])
 
     def _render_review(self) -> FormattedText:
+        judge = display_model_name(self.state.analyzer_model).upper()
         if not self.state.review_command:
             return FormattedText([
-                ("class:report.heading", "CODEX FOLLOW-UP\n\n"),
-                ("class:muted", "A readable Codex review becomes available after successful analysis."),
+                ("class:report.heading", f"{judge} FOLLOW-UP\n\n"),
+                ("class:muted", "A readable judge review becomes available after successful analysis."),
             ])
         return FormattedText([
-            ("class:report.heading", "CODEX FOLLOW-UP  //  INTERACTIVE\n\n"),
+            ("class:report.heading", f"{judge} FOLLOW-UP  //  INTERACTIVE\n\n"),
             ("class:soft", "Continue the completed analysis in this terminal:\n"),
             ("class:violet", "  /chat\n\n"),
             ("class:soft", "Or open another terminal tab and run:\n\n"),
@@ -752,7 +757,7 @@ class SwarmerzApp:
             ("class:accent", "F3"), ("class:soft", "  hunter reports\n"),
             ("class:accent", "F4"), ("class:soft", "  adjudicator synthesis   "),
             ("class:accent", "F5"), ("class:soft", "  mission telemetry\n"),
-            ("class:accent", "F8"), ("class:soft", "  Codex follow-up / review chat\n"),
+            ("class:accent", "F8"), ("class:soft", "  judge follow-up / review chat\n"),
             ("class:accent", "F9"), ("class:soft", "  cycle color theme (or /theme NAME)\n"),
             ("class:accent", "F6"),
             ("class:soft", "  copy selection, or entire WORKSPACE with no selection\n"),
@@ -768,7 +773,7 @@ class SwarmerzApp:
             ("class:soft", "  jump or mouse-scroll\n"),
             ("", "\n"),
             ("class:violet", "/all MESSAGE"), ("class:soft", "       steer every active parent and worker\n"),
-            ("class:violet", "/to ID MESSAGE"), ("class:soft", "     target one hunter swarm\n"),
+            ("class:violet", "/to ID MESSAGE"), ("class:soft", "     target or resume one recoverable hunter\n"),
             ("class:violet", "/wrap [ID]"), ("class:soft", "         ask all or one swarm to finish cleanly\n"),
             ("class:violet", "/status"), ("class:soft", "            inspect steering readiness\n"),
             ("class:violet", "/focus ID"), ("class:soft", "          select a hunter card\n"),
@@ -776,7 +781,7 @@ class SwarmerzApp:
             ("class:violet", "/theme [NAME]"), ("class:soft", "      list or pick a color theme\n"),
             ("class:violet", "/clear"), ("class:soft", "             clear only the local rail, never artifacts\n"),
             ("class:violet", "/quit"), ("class:soft", "              exit only after the mission is terminal\n"),
-            ("class:violet", "/chat"), ("class:soft", "              open or resume the completed Codex review\n"),
+            ("class:violet", "/chat"), ("class:soft", "              open or resume the completed judge review\n"),
             ("", "\n"),
             ("class:amber", "Safety invariant: closing the deck never kills active model work."),
         ])
@@ -834,7 +839,8 @@ class SwarmerzApp:
         if selected:
             fragments.extend([
                 ("class:muted", "FOCUS  "),
-                ("class:violet", f"{selected.spec.id}"),
+                ("class:violet", f"{selected.spec.label}"),
+                ("class:muted", f" [{selected.spec.id}]"),
                 ("class:muted", f"  {selected.spec.harness} · {selected.spec.effort}\n"),
                 ("class:soft", f" {_clip(selected.spec.provider, 32)}\n"),
                 ("class:soft", f" {_clip(selected.spec.model, 32)}\n"),

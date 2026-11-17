@@ -79,6 +79,23 @@ def test_empty_activity_view_has_a_useful_idle_state() -> None:
     assert fragment_list_to_text(rendered) == "\n  Waiting for signal…"
 
 
+def test_codex_hunter_is_displayed_by_model_name_not_harness_id() -> None:
+    app = object.__new__(SwarmerzApp)
+    app.state = MissionState(
+        "test", "wait", (
+            HunterSpec(
+                "codex", "openai", "gpt-daybreak-blue-latest", "xhigh", 4,
+                "codex-exec",
+            ),
+        )
+    )
+
+    fleet = fragment_list_to_text(app._render_fleet())
+    assert "DAYBREAK" in fleet
+    assert "CODEX" not in fleet
+    assert app.state.hunters["codex"].spec.label == "daybreak"
+
+
 def test_workspace_mouse_wheel_routes_to_virtual_viewport() -> None:
     motion: list[int] = []
     window = _WorkspaceWindow(
@@ -125,6 +142,7 @@ def test_final_result_reconciles_fleet_and_exposes_codex_follow_up() -> None:
             HunterOutcome("beta", "completed", True, 3, 4, degraded=True),
         ),
         review_command="swarmerz chat --session test --round-id round-1",
+        analyzer_model="gpt-5.6-sol",
     ))
 
     assert app.state.phase is MissionPhase.DEGRADED
@@ -136,9 +154,13 @@ def test_final_result_reconciles_fleet_and_exposes_codex_follow_up() -> None:
 
     app.state.view = "review"
     rendered = fragment_list_to_text(app._render_main())
-    assert "CODEX FOLLOW-UP" in rendered
+    assert "GPT-5.6-SOL FOLLOW-UP" in rendered
     assert "/chat" in rendered
     assert app.state.review_command in rendered
+
+    app.state.view = "synthesis"
+    rendered = fragment_list_to_text(app._render_main())
+    assert "GPT-5.6-SOL SYNTHESIS" in rendered
 
 
 def test_historical_result_is_clearly_marked_read_only() -> None:

@@ -6,12 +6,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import os
 import re
 import shutil
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from .adapters import build_hunter_command
 from .artifacts import (
@@ -76,6 +77,122 @@ def _is_terminal_opencode_provider_failure(
 
 class HunterExecutionMixin:
     """Own hunter preparation, harness preflight, execution, and answer sealing."""
+
+    async def _recover_opencode_from_operator(
+        self,
+        engine: EngineConfig,
+        spec: CommandSpec,
+        *,
+        artifact_dir: Path,
+        session_id: str,
+        endpoint: OpenCodeEndpoint,
+        result: dict[str, Any],
+        try_seal: Callable[[], bool],
+        wait_for_late_artifact: Callable[..., Awaitable[bool]],
+    ) -> None:
+        """Keep a verified native OpenCode session targetable while peers run."""
+        if self.live_control is None:
+            return
+        attempts: list[dict[str, Any]] = []
+        initial_failure = {
+            key: result.get(key)
+            for key in ("status", "exit_code", "timed_out", "artifact_error", "diagnostic")
+            if result.get(key) is not None
+        }
+        while (
+            not result.get("answer_sealed")
+            and (
+                self.live_control.recovery_window_open(engine.id)
+                or self.live_control.has_pending_recovery(engine.id)
+            )
+        ):
+            self.live_control.mark_recoverable(engine.id)
+            detail = str(
+                result.get("diagnostic")
+                or result.get("artifact_error")
+                or result.get("error")
+                or result.get("status")
+                or "failed"
+            )
+            display_name = self._hunter_progress_name(engine)
+            self._emit(
+                f"[{display_name}] OpenCode session failed; recovery available while "
+                f"other hunters run. Use /to {engine.id} MESSAGE to resume the same "
+                f"session. Detail: {detail[:240]}"
+            )
+            instruction: str | None = None
+            while (
+                self.live_control.recovery_window_open(engine.id)
+                or self.live_control.has_pending_recovery(engine.id)
+            ):
+                instruction = await self.live_control.next_recovery(engine.id)
+                if instruction is not None:
+                    break
+            if instruction is None:
+                break
+            self.live_control.mark_resuming(engine.id)
+            self._emit(
+                f"[{display_name}] resuming recoverable OpenCode session from targeted "
+                "operator instruction"
+            )
+            recovery_spec = self._opencode_resume_spec(
+                spec, session_id, instruction
+            )
+            log_stem = f"operator-recovery-{len(attempts) + 1:02d}"
+            attempt_started = time.monotonic()
+            try:
+                recovery_result = await self._execute_opencode_finalize(
+                    engine,
+                    recovery_spec,
+                    artifact_dir=artifact_dir,
+                    session_id=session_id,
+                    endpoint=endpoint,
+                    log_stem=log_stem,
+                )
+            except (ConfigError, OSError, RuntimeError, TimeoutError) as exc:
+                recovery_result = {
+                    "status": "timed_out" if isinstance(exc, TimeoutError) else "failed",
+                    "exit_code": None,
+                    "timed_out": isinstance(exc, TimeoutError),
+                    "error": str(exc),
+                }
+            recovery_result["duration_seconds"] = round(
+                time.monotonic() - attempt_started, 3
+            )
+            attempts.append({
+                "instruction_sha256": hashlib.sha256(
+                    instruction.encode("utf-8")
+                ).hexdigest(),
+                "session_id": session_id,
+                **recovery_result,
+            })
+            result["status"] = recovery_result.get("status")
+            result["exit_code"] = recovery_result.get("exit_code")
+            result["timed_out"] = recovery_result.get("timed_out")
+            result["duration_seconds"] = round(
+                float(result.get("duration_seconds") or 0)
+                + float(recovery_result.get("duration_seconds") or 0),
+                3,
+            )
+            if result.get("worker_contract_verified"):
+                try_seal()
+                if (
+                    not result.get("answer_sealed")
+                    and recovery_result.get("status") == "completed"
+                ):
+                    await wait_for_late_artifact(
+                        min(self.config.opencode_worker_poll_seconds, 30),
+                        phase="operator_recovery_artifact",
+                    )
+            if result.get("answer_sealed"):
+                result["status"] = "completed"
+                break
+
+        if attempts:
+            result["operator_recovery_initial_failure"] = initial_failure
+            result["operator_recovery_attempts"] = attempts
+            result["operator_recovery_count"] = len(attempts)
+            result["resumed_after_failure"] = bool(result.get("answer_sealed"))
 
     def _prepare_hunter(self, engine: EngineConfig) -> tuple[EngineConfig, Any, Path]:
         workspace = self.run_dir / "workspaces" / "hunters" / engine.id
@@ -598,7 +715,7 @@ class HunterExecutionMixin:
                         return False
                     if elapsed >= next_notice:
                         remaining = max(0, int(seconds - elapsed))
-                        if phase == "recovery_artifact":
+                        if phase in {"recovery_artifact", "operator_recovery_artifact"}:
                             self._emit(
                                 f"[{engine.id}] finalization returned; waiting up to "
                                 f"{remaining}s for the answer artifact"
@@ -827,6 +944,29 @@ class HunterExecutionMixin:
                             min(self.config.opencode_worker_poll_seconds, 30),
                             phase="recovery_artifact",
                         )
+
+            if (
+                not result["answer_sealed"]
+                and native_opencode
+                and session_id
+                and endpoint is not None
+                and self.live_control is not None
+                and bool(result.get("worker_contract_verified"))
+                and not (
+                    worker_monitor
+                    and worker_monitor.get("reason") == "status_unavailable"
+                )
+            ):
+                await self._recover_opencode_from_operator(
+                    engine,
+                    spec,
+                    artifact_dir=artifact_dir,
+                    session_id=str(session_id),
+                    endpoint=endpoint,
+                    result=result,
+                    try_seal=try_seal,
+                    wait_for_late_artifact=wait_for_late_artifact,
+                )
 
             if not result["answer_sealed"]:
                 partial_notes = collect_partial_notes(spec.cwd, artifact_dir)

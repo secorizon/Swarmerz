@@ -11,6 +11,12 @@ from enum import StrEnum
 from pathlib import Path
 
 
+def display_model_name(model: str) -> str:
+    """Return a compact operator-facing model name without changing its ID."""
+    leaf = model.rsplit("/", 1)[-1]
+    return "daybreak" if "daybreak" in leaf.lower() else leaf
+
+
 class MissionPhase(StrEnum):
     READY = "ready"
     SETUP = "setup"
@@ -29,6 +35,7 @@ class HunterPhase(StrEnum):
     STARTING = "starting"
     HUNTING = "hunting"
     BLOCKED = "blocked"
+    RECOVERABLE = "recoverable"
     CONSOLIDATING = "consolidating"
     SEALED = "sealed"
     PARTIAL = "partial"
@@ -54,7 +61,11 @@ class HunterSpec:
 
     @property
     def label(self) -> str:
-        return self.model if self.provider == "ollama" else self.id
+        if self.provider == "ollama":
+            return self.model
+        if self.harness in {"codex", "codex-exec"}:
+            return display_model_name(self.model)
+        return self.id
 
 
 @dataclass
@@ -117,6 +128,7 @@ class MissionState:
     filter_text: str = ""
     command_target: str = "all"
     notice: str = "Ready. Press F1 for the command map."
+    analyzer_model: str = "judge"
 
     def __post_init__(self) -> None:
         self.hunters = {spec.id: HunterState(spec) for spec in self.specs}

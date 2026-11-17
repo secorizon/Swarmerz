@@ -12,6 +12,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .models import display_model_name
 from .orchestration.adapters import _executable
 from .orchestration.artifacts import read_json
 from .orchestration.models import ConfigError
@@ -110,7 +111,12 @@ def chat(
         raise ConfigError(
             "chat requires an interactive terminal; use --print-command to inspect the launch"
         )
-    print("[Swarmerz] launching readable Codex follow-up; the first response may take a moment", file=sys.stderr)
+    print(
+        f"[Swarmerz] launching readable "
+        f"{display_model_name(config.analyzer.effective_model)} follow-up; "
+        "the first response may take a moment",
+        file=sys.stderr,
+    )
     storage = StorageManager(config.storage) if hasattr(config, "storage") else None
     environment = None
     successful = False

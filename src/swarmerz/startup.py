@@ -234,7 +234,7 @@ class StartupApp:
             return FormattedText([
                 ("class:violet", "LOAD PREVIOUS MISSION\n\n"),
                 ("class:soft", f"Browse {len(self.missions)} stored round(s). Fleet status, "
-                 "sealed reports, synthesis, artifacts, and Codex follow-up are restored."),
+                 "sealed reports, synthesis, artifacts, and judge follow-up are restored."),
             ])
         mission = self.selected_mission
         if mission is None:

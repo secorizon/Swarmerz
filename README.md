@@ -207,9 +207,12 @@ a multi-hour audit.
   exposes provider, model, harness, effort, and the latest state detail for the focused hunter.
 - Supports local-only, hosted-only, and mixed fleets; model identity is configuration rather than
   application logic.
+- Labels native Codex-backed hunters and judges by their configured model (`DAYBREAK`,
+  `GPT-5.6-SOL`, and so on), while retaining each hunter's stable configuration ID in brackets for
+  `/to`, artifacts, and replay.
 - Turns raw progress into a timestamped, filterable signal rail.
 - Switches instantly among activity, sealed hunter reports, and final adjudicator synthesis.
-- Offers an optional `F8` Codex follow-up when the primary analyzer is native Codex: `/chat` opens
+- Offers an optional `F8` judge follow-up when the primary analyzer is native Codex: `/chat` opens
   the readable review in the current terminal, while the displayed command can be pasted into
   another terminal tab.
 - Gives every workspace a real bounded viewport, visible scrollbar, line/page navigation,
@@ -234,7 +237,7 @@ a multi-hour audit.
   reference existing local paths are refused with guidance before launch. No model process exists
   until the final instruction is submitted.
 - Opens with a mission choice: start a new scan, or browse stored rounds newest-first and reload
-  their fleet state, reports, synthesis, artifacts, elapsed time, and `F8` Codex follow-up without
+  their fleet state, reports, synthesis, artifacts, elapsed time, and `F8` judge follow-up without
   launching any model work.
 - Ships seven color templates (`abyss`, `ember`, `forest`, `solar`, `glacier`, `mono`, `neon`),
   with `mono` as the default.
@@ -484,7 +487,7 @@ numeric indexes. Repeat the option for multiple overrides:
 ```text
 swarmerz run       Start a new round or open the stored-round picker
 swarmerz analyze   Retry primary adjudication for one incomplete round
-swarmerz chat      Open a Codex follow-up when the primary analyzer is native Codex
+swarmerz chat      Open a judge follow-up when the primary analyzer is native Codex
 swarmerz cache     Inspect, prune, or clear disposable SSD cache data
 swarmerz doctor    Check the installation, platform helpers, and an optional deployment profile
 swarmerz demo      Run the interface without contacting providers
@@ -552,7 +555,7 @@ installs the wheel on clean Linux and macOS runners, then executes the installed
 | Command | Effect |
 |---|---|
 | plain text or `/all MESSAGE` | Steer all active parents and unfinished workers |
-| `/to ID MESSAGE` | Steer one hunter swarm |
+| `/to ID MESSAGE` | Steer one hunter swarm, or resume a recoverable harness session |
 | `/wrap [ID]` | Ask all or one swarm to stop branching and consolidate |
 | `/status` | Show live steering readiness |
 | `/focus ID` | Select a hunter card |
@@ -567,6 +570,17 @@ installs the wheel on clean Linux and macOS runners, then executes the installed
 Steering is an instruction, not a forced timeout or a guarantee of immediate completion. `Ctrl-Q`
 and `/quit` refuse to terminate active model work. Use `/wrap` to request clean consolidation.
 
+If a native Codex hunter or a native OpenCode hunter with a verified worker session fails while
+another hunter is still open, Swarmerz keeps its resumable harness state alive and marks it
+`RECOVERABLE`. Use `/to ID MESSAGE` to start a follow-up in the same Codex thread or OpenCode
+session; for example, `/to codex continue and complete the audit`.
+Recovery is deliberately targeted: `/all` does not revive failed hunters. The recovery window
+closes when the rest of the fleet finishes, and the round records each recovery outcome plus a
+SHA-256 digest of the operator instruction without copying its text into `result.json`. OpenCode
+startup, authentication, routing, and pre-fan-out failures without a verified worker session are
+not presented as resumable. Cline and custom command adapters are not resumable through `/to`
+because Swarmerz does not have a portable persistent-session contract for those processes.
+
 | Key | Effect |
 |---|---|
 | `F1` | Command map |
@@ -574,7 +588,7 @@ and `/quit` refuse to terminate active model work. Use `/wrap` to request clean 
 | `F6` | Copy the WORKSPACE selection, or the complete workspace when nothing is selected |
 | `F7` | Compatibility alias for `F6` |
 | `Ctrl-C` | Copy while the WORKSPACE selection has focus |
-| `F8` | Codex follow-up view |
+| `F8` | Judge follow-up view |
 | `F9` | Cycle theme |
 | `Tab` / `Shift-Tab` | Select next / previous hunter |
 
@@ -700,9 +714,10 @@ without duplicating its file data.
   mission genuinely requires a larger bounded workload.
 - **Primary analysis failed after hunters sealed:** use `swarmerz analyze`; do not start a new round
   merely to retry adjudication.
-- **Follow-up chat appears idle:** current builds print `[Swarmerz] launching readable Codex
-  follow-up...` before starting the installed Codex CLI. Use `swarmerz chat --print-command` to
-  inspect the launch and confirm Codex authentication without starting the review.
+- **Follow-up chat appears idle:** current builds print `[Swarmerz] launching readable
+  <judge-model> follow-up...` before starting the installed Codex CLI. Use
+  `swarmerz chat --print-command` to inspect the launch and confirm Codex authentication without
+  starting the review.
 - **A stored round is missing:** use the same `--config` and `--set output_root=...` values that
   created it.
 

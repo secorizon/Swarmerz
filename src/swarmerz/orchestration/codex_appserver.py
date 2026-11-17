@@ -15,7 +15,8 @@ import signal
 from pathlib import Path
 from typing import Any, Callable
 
-from .models import CommandSpec, EngineConfig
+from .artifacts import read_answer
+from .models import CommandSpec, ConfigError, EngineConfig
 from .resource_limits import ResourceInvocation, ResourceLimiter
 from .storage import prepare_managed_environment
 
@@ -157,6 +158,7 @@ class CodexAppServer:
         self, spec: CommandSpec, engine: EngineConfig, *, stdout_path: Path,
         stderr_path: Path, emit: Callable[[str], None],
         resource_limiter: ResourceLimiter | None = None,
+        runtime_seconds: int | None = None,
     ) -> None:
         # The normal hunter command is `codex exec ... PROMPT`; retain its pinned
         # executable and environment, but use the documented live RPC transport.
@@ -174,7 +176,7 @@ class CodexAppServer:
             resource_limiter.prepare(
                 argv,
                 role=spec.env.get("SWARM_ROLE_ID", "codex"),
-                runtime_seconds=engine.timeout_seconds + 60,
+                runtime_seconds=runtime_seconds or engine.timeout_seconds + 60,
                 environment=spec.env,
             )
             if resource_limiter is not None
@@ -205,14 +207,21 @@ class CodexAppServer:
         if not isinstance(self.thread_id, str):
             raise RuntimeError("Codex thread/start returned no thread id")
 
-    async def run(self, spec: CommandSpec, engine: EngineConfig) -> dict[str, Any]:
+    async def run(
+        self,
+        spec: CommandSpec,
+        engine: EngineConfig,
+        *,
+        prompt: str | None = None,
+    ) -> dict[str, Any]:
         assert self.thread_id is not None
         self._completed = asyncio.get_running_loop().create_future()
+        self._last_message = ""
         schema_path = Path(__file__).resolve().parent / "schemas" / "answer.schema.json"
-        prompt = spec.argv[-1]
+        turn_prompt = spec.argv[-1] if prompt is None else prompt
         started = await self._request("turn/start", {
             "threadId": self.thread_id,
-            "input": [{"type": "text", "text": prompt}],
+            "input": [{"type": "text", "text": turn_prompt}],
             "model": engine.effective_model,
             "effort": engine.reasoning_effort,
             "cwd": str(spec.cwd),
@@ -238,10 +247,43 @@ class CodexAppServer:
             except (ValueError, OSError):
                 pass
         error = turn.get("error") if isinstance(turn.get("error"), dict) else {}
-        return {"status": "completed" if status == "completed" else "failed",
-                "exit_code": 0 if status == "completed" else 1,
-                "timed_out": False, "duration_seconds": 0,
-                **({"error": error.get("message", str(error))} if error else {})}
+        artifact_error: str | None = None
+        answer_contract_valid = False
+        if spec.artifact_path:
+            if spec.artifact_path.is_symlink():
+                artifact_error = (
+                    f"Codex turn left a symlink answer: {spec.artifact_path}"
+                )
+            elif not spec.artifact_path.is_file():
+                artifact_error = (
+                    f"Codex turn did not produce an answer: {spec.artifact_path}"
+                )
+            else:
+                try:
+                    read_answer(
+                        spec.artifact_path,
+                        minimum_workstreams=engine.swarm_size,
+                    )
+                    answer_contract_valid = True
+                except (OSError, ConfigError) as exc:
+                    artifact_error = f"Codex turn produced an invalid answer: {exc}"
+        completed_ok = status == "completed" and (
+            spec.artifact_path is None or answer_contract_valid
+        )
+        result: dict[str, Any] = {
+            "status": "completed" if completed_ok else "failed",
+            "exit_code": 0 if completed_ok else 1,
+            "timed_out": False,
+            "duration_seconds": 0,
+            "answer_contract_valid": answer_contract_valid,
+        }
+        if artifact_error:
+            result["artifact_error"] = artifact_error
+        if error:
+            result["error"] = error.get("message", str(error))
+        elif status == "completed" and artifact_error:
+            result["error"] = artifact_error
+        return result
 
     async def steer(self, message: str) -> None:
         if not self.thread_id or not self.turn_id:

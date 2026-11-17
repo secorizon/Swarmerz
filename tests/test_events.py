@@ -86,7 +86,7 @@ def test_multiline_codex_message_retains_source_and_cannot_fake_lifecycle_events
 
 
 @pytest.mark.parametrize("phase", [
-    HunterPhase.BLOCKED, HunterPhase.CONSOLIDATING, HunterPhase.SEALED,
+    HunterPhase.BLOCKED, HunterPhase.RECOVERABLE, HunterPhase.CONSOLIDATING, HunterPhase.SEALED,
     HunterPhase.PARTIAL, HunterPhase.FAILED,
 ])
 def test_late_live_output_preserves_lifecycle_state(phase: HunterPhase) -> None:
@@ -115,6 +115,28 @@ def test_codex_startup_warning_is_not_evidence_of_active_work() -> None:
 
     assert state.hunters["codex"].phase is HunterPhase.STARTING
     assert state.events[-1].level is EventLevel.WARNING
+
+
+def test_codex_recovery_lifecycle_is_visible_and_can_return_to_hunting() -> None:
+    state = _state()
+    ingest_progress(state, "[gpt-5.6-sol] started: codex-exec model")
+    ingest_progress(
+        state,
+        "[gpt-5.6-sol] Codex turn failed; recovery available while other hunters run. "
+        "Use /to codex MESSAGE to resume the same thread.",
+    )
+
+    hunter = state.hunters["codex"]
+    assert hunter.phase is HunterPhase.RECOVERABLE
+    assert state.events[-1].level is EventLevel.WARNING
+    assert state.notice.startswith("ATTENTION · codex:")
+
+    ingest_progress(
+        state,
+        "[gpt-5.6-sol] resuming recoverable Codex thread from targeted operator instruction",
+    )
+    assert hunter.phase is HunterPhase.HUNTING
+    assert "operator instruction" in hunter.detail
 
 
 def test_permission_probe_timeout_is_warning_not_hunter_failure() -> None:

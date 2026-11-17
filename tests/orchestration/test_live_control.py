@@ -18,6 +18,7 @@ from swarmerz.orchestration.codex_appserver import CodexAppServer
 from swarmerz.orchestration.live_control import LiveControl
 from swarmerz.orchestration.models import CommandSpec, ConfigError
 from swarmerz.orchestration.opencode_permissions import OpenCodeEndpoint, steer_session
+from swarmerz.orchestration.runner import AuditRunner
 
 
 class LiveControlTests(unittest.TestCase):
@@ -74,6 +75,192 @@ class LiveControlTests(unittest.TestCase):
                     "expectedTurnId": "turn-b",
                 })
         asyncio.run(scenario())
+
+    def test_recoverable_codex_requires_targeted_followup(self) -> None:
+        async def scenario() -> None:
+            control = LiveControl()
+            client = CodexAppServer()
+            client.thread_id = "thread-a"
+            control.register_codex("codex", client)
+            control.mark_recoverable("codex")
+
+            self.assertEqual(await control.send("continue"), [])
+            self.assertIn("Codex RECOVERABLE", control.status())
+            self.assertEqual(
+                await control.send("continue", "codex"),
+                ["codex: recovery instruction queued for the same Codex thread"],
+            )
+            self.assertEqual(
+                await control.send("another instruction", "codex"),
+                [
+                    "codex: recovery not queued "
+                    "(a recovery instruction is already queued)"
+                ],
+            )
+            self.assertEqual(
+                await control.next_recovery("codex", timeout_seconds=0.01), "continue"
+            )
+
+        asyncio.run(scenario())
+
+    def test_failed_codex_turn_can_resume_while_peer_is_open(self) -> None:
+        async def scenario(root: Path) -> None:
+            engine = SimpleNamespace(
+                id="codex", harness="codex-exec", command=(), timeout_seconds=10,
+                provider="openai", effective_model="gpt-daybreak-blue-latest",
+            )
+            runner = object.__new__(AuditRunner)
+            runner.config = SimpleNamespace(hunters=(engine,))
+            runner.live_control = LiveControl()
+            runner.live_control.active.update({"codex", "peer"})
+            runner._resource_limiter = None
+            messages: list[str] = []
+            runner.progress = messages.append
+            client = CodexAppServer()
+            turns: list[str | None] = []
+
+            async def start(*_args: object, **_kwargs: object) -> None:
+                client.thread_id = "thread-a"
+
+            async def run(
+                _spec: CommandSpec, _engine: object, *, prompt: str | None = None,
+            ) -> dict[str, object]:
+                turns.append(prompt)
+                if len(turns) == 1:
+                    return {
+                        "status": "failed", "exit_code": 1, "timed_out": False,
+                        "duration_seconds": 0, "error": "request denied",
+                    }
+                return {
+                    "status": "completed", "exit_code": 0, "timed_out": False,
+                    "duration_seconds": 0,
+                }
+
+            spec = CommandSpec(
+                argv=("codex", "exec", "initial prompt"), cwd=root, env={},
+                artifact_path=root / "answer.json",
+            )
+            with mock.patch(
+                "swarmerz.orchestration.runner.CodexAppServer", return_value=client
+            ), mock.patch.object(client, "start", side_effect=start), mock.patch.object(
+                client, "run", side_effect=run
+            ):
+                task = asyncio.create_task(runner._execute_with_transport_retries(
+                    engine, spec, role="codex", stdout_path=root / "stdout.jsonl",
+                    stderr_path=root / "stderr.log",
+                ))
+                for _ in range(100):
+                    if "codex" in runner.live_control.recoverable:
+                        break
+                    await asyncio.sleep(0)
+                self.assertIn("codex", runner.live_control.recoverable)
+                self.assertEqual(
+                    await runner.live_control.send("continue", "codex"),
+                    ["codex: recovery instruction queued for the same Codex thread"],
+                )
+                result = await asyncio.wait_for(task, timeout=2)
+
+            self.assertEqual(turns, [None, "continue"])
+            self.assertEqual(result["status"], "completed")
+            self.assertTrue(result["resumed_after_failure"])
+            self.assertEqual(result["recovery_count"], 1)
+            self.assertEqual(
+                result["recovery_attempts"][0]["instruction_sha256"],
+                "e256ee8e7aff6957a781d8328f0f68e26996564c81fa458da59fbca2305138ad",
+            )
+            self.assertTrue(any("recovery available" in item for item in messages))
+            self.assertTrue(any("resuming recoverable" in item for item in messages))
+            self.assertTrue(all("[codex]" not in item for item in messages))
+            self.assertTrue(any("[daybreak]" in item for item in messages))
+
+        with tempfile.TemporaryDirectory() as directory:
+            asyncio.run(scenario(Path(directory)))
+
+    def test_failed_opencode_session_can_resume_while_peer_is_open(self) -> None:
+        async def scenario(root: Path) -> None:
+            endpoint = OpenCodeEndpoint(
+                "http://127.0.0.1:1234", "private", root / "workspace"
+            )
+            engine = SimpleNamespace(
+                id="deepseek", harness="opencode", command=(), provider="deepseek",
+                effective_model="deepseek-v4.1-flash-1017", swarm_size=2,
+            )
+            runner = object.__new__(AuditRunner)
+            runner.config = SimpleNamespace(opencode_worker_poll_seconds=0)
+            runner.live_control = LiveControl()
+            runner.live_control.register_opencode("deepseek", endpoint)
+            runner.live_control.active.add("peer")
+            messages: list[str] = []
+            runner.progress = messages.append
+            result: dict[str, object] = {
+                "status": "failed", "exit_code": 1, "timed_out": False,
+                "duration_seconds": 1, "answer_sealed": False,
+                "worker_contract_verified": True, "artifact_error": "missing answer",
+            }
+            spec = CommandSpec(
+                argv=("opencode", "run"), cwd=root, env={},
+                artifact_path=root / ".swarm" / "answer.json",
+            )
+            ready_to_seal = False
+
+            def try_seal() -> bool:
+                result["answer_sealed"] = ready_to_seal
+                return ready_to_seal
+
+            async def finalize(*_args: object, **kwargs: object) -> dict[str, object]:
+                nonlocal ready_to_seal
+                self.assertEqual(kwargs["log_stem"], "operator-recovery-01")
+                ready_to_seal = True
+                return {
+                    "status": "completed", "exit_code": 0, "timed_out": False,
+                    "duration_seconds": 0,
+                }
+
+            async def wait_for_artifact(*_args: object, **_kwargs: object) -> bool:
+                return try_seal()
+
+            with mock.patch.object(
+                runner, "_opencode_resume_spec", return_value=spec
+            ), mock.patch.object(
+                runner, "_execute_opencode_finalize", side_effect=finalize
+            ):
+                task = asyncio.create_task(runner._recover_opencode_from_operator(
+                    engine,
+                    spec,
+                    artifact_dir=root,
+                    session_id="ses-parent",
+                    endpoint=endpoint,
+                    result=result,
+                    try_seal=try_seal,
+                    wait_for_late_artifact=wait_for_artifact,
+                ))
+                for _ in range(100):
+                    if "deepseek" in runner.live_control.recoverable:
+                        break
+                    await asyncio.sleep(0)
+                self.assertIn("deepseek", runner.live_control.recoverable)
+                self.assertIn("OpenCode RECOVERABLE", runner.live_control.status())
+                self.assertEqual(
+                    await runner.live_control.send("continue", "deepseek"),
+                    [
+                        "deepseek: recovery instruction queued for the same "
+                        "OpenCode session"
+                    ],
+                )
+                await asyncio.wait_for(task, timeout=2)
+
+            self.assertTrue(result["answer_sealed"])
+            self.assertTrue(result["resumed_after_failure"])
+            self.assertEqual(result["operator_recovery_count"], 1)
+            self.assertEqual(
+                result["operator_recovery_attempts"][0]["instruction_sha256"],
+                "e256ee8e7aff6957a781d8328f0f68e26996564c81fa458da59fbca2305138ad",
+            )
+            self.assertTrue(any("OpenCode session failed" in item for item in messages))
+            self.assertTrue(any("resuming recoverable OpenCode" in item for item in messages))
+
+        with tempfile.TemporaryDirectory() as directory:
+            asyncio.run(scenario(Path(directory)))
 
     def test_opencode_request_uses_steer_not_a_new_run(self) -> None:
         endpoint = OpenCodeEndpoint("http://127.0.0.1:1234", "private", Path("/tmp/glm"))
@@ -186,7 +373,11 @@ class LiveControlTests(unittest.TestCase):
                 if method == "turn/start":
                     answer = {"answer": "Test response", "key_points": [],
                               "assumptions": [], "uncertainties": [], "sources": [],
-                              "workstreams": [], "confidence": 0.5}
+                              "workstreams": [
+                                  {"name": f"worker-{index}", "scope": "source",
+                                   "conclusion": "done"}
+                                  for index in range(4)
+                              ], "confidence": 0.5}
                     for event in (
                         {"method": "turn/started", "params": {
                             "threadId": "thread-a", "turn": {"id": "turn-b"}}},
@@ -242,13 +433,51 @@ class LiveControlTests(unittest.TestCase):
                 await client.start(spec, engine, stdout_path=root / "stdout.jsonl",
                                    stderr_path=root / "stderr.log", emit=lambda _: None)
                 result = await client.run(spec, engine)
+                resumed = await client.run(spec, engine, prompt="continue")
             self.assertIn("agents.max_concurrent_threads_per_session=4", launch.call_args.args)
             self.assertEqual(result["status"], "completed")
+            self.assertEqual(resumed["status"], "completed")
             self.assertEqual(json.loads(spec.artifact_path.read_text())["answer"], "Test response")
-            turn_request = next(item for item in writer.messages if item.get("method") == "turn/start")
-            self.assertEqual(turn_request["params"]["effort"], "high")
+            turn_requests = [
+                item for item in writer.messages if item.get("method") == "turn/start"
+            ]
+            self.assertEqual(turn_requests[0]["params"]["effort"], "high")
+            self.assertEqual(
+                turn_requests[1]["params"]["input"],
+                [{"type": "text", "text": "continue"}],
+            )
             stdout.feed_eof()
             await client.close()
+
+        with tempfile.TemporaryDirectory() as directory:
+            asyncio.run(scenario(Path(directory)))
+
+    def test_completed_codex_turn_without_answer_is_a_recoverable_failure(self) -> None:
+        async def scenario(root: Path) -> None:
+            client = CodexAppServer()
+            client.thread_id = "thread-a"
+            spec = CommandSpec(
+                argv=("codex", "exec", "prompt"), cwd=root, env={},
+                artifact_path=root / "missing-answer.json",
+            )
+            engine = SimpleNamespace(
+                effective_model="gpt-test", reasoning_effort="high",
+                timeout_seconds=10, swarm_size=1,
+            )
+
+            async def request(method: str, _params: object) -> dict[str, object]:
+                self.assertEqual(method, "turn/start")
+                asyncio.get_running_loop().call_soon(
+                    client._completed.set_result,
+                    {"turn": {"id": "turn-b", "status": "completed"}},
+                )
+                return {"turn": {"id": "turn-b", "status": "inProgress"}}
+
+            with mock.patch.object(client, "_request", side_effect=request):
+                result = await client.run(spec, engine)
+
+            self.assertEqual(result["status"], "failed")
+            self.assertIn("did not produce an answer", result["error"])
 
         with tempfile.TemporaryDirectory() as directory:
             asyncio.run(scenario(Path(directory)))
