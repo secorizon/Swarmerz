@@ -64,6 +64,14 @@ class IsolationConfig:
 
 
 @dataclass(frozen=True)
+class ResourceLimitsConfig:
+    mode: str = "auto"
+    memory_max_bytes: int = 16 * 1024**3
+    memory_swap_max_bytes: int = 2 * 1024**3
+    tasks_max: int = 512
+
+
+@dataclass(frozen=True)
 class StorageConfig:
     cache_root: Path
     max_cache_bytes: int = 40 * 1024**3
@@ -94,6 +102,7 @@ class AppConfig:
     analyzer: AnalyzerConfig
     secondary_analyzer: AnalyzerConfig | None
     isolation: IsolationConfig
+    resources: ResourceLimitsConfig
     storage: StorageConfig
     raw: dict[str, Any]
 

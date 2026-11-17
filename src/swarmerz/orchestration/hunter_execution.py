@@ -26,7 +26,12 @@ from .fanout import build_fanout_manifest, fanout_summary
 from .instructions import build_hunter_instruction
 from .models import CommandSpec, ConfigError, EngineConfig
 from .opencode_permissions import OpenCodeEndpoint
-from .opencode_server import IsolatedOpenCodeServer, attach_server
+from .opencode_server import (
+    IsolatedOpenCodeServer,
+    attach_server,
+    cleanup_private_opencode_state,
+    provision_provider_environment,
+)
 from .protocol_support import engine_manifest as _engine_manifest
 
 
@@ -218,6 +223,7 @@ class HunterExecutionMixin:
         stored_auth_engines = [
             engine
             for engine in opencode_engines
+            if self.config.isolation.opencode_server_mode != "per_hunter"
             if engine.provider != "ollama"
             and not any(name in os.environ for name in engine.pass_env)
             and not engine.env
@@ -264,6 +270,28 @@ class HunterExecutionMixin:
     async def _run_hunters(self) -> list[dict[str, Any]]:
         prepared = [self._prepare_hunter(engine) for engine in self.config.hunters]
         per_hunter_servers = self.config.isolation.opencode_server_mode == "per_hunter"
+        native_opencode_engines = [
+            engine
+            for engine in self.config.hunters
+            if engine.harness == "opencode" and not engine.command
+        ]
+
+        def server_runtime(engine: EngineConfig) -> int:
+            worker_timeout = (
+                engine.worker_timeout_seconds
+                or self.config.opencode_worker_timeout_seconds
+            )
+            return (
+                engine.timeout_seconds
+                + worker_timeout
+                + self.config.opencode_finalize_timeout_seconds
+                + 300
+            )
+
+        shared_server_runtime = max(
+            (server_runtime(engine) for engine in native_opencode_engines),
+            default=3600,
+        )
         service_template_spec = (
             None if per_hunter_servers else self._shared_opencode_service_spec(prepared)
         )
@@ -879,11 +907,14 @@ class HunterExecutionMixin:
 
             if per_hunter_servers:
                 private_server: IsolatedOpenCodeServer | None = None
+                private_spec: CommandSpec | None = None
                 try:
                     private_spec = self._per_hunter_opencode_service_spec(engine, spec)
                     private_server = await IsolatedOpenCodeServer.start(
                         private_spec,
                         artifact_dir=self.run_dir / "opencode-services" / engine.id,
+                        resource_limiter=self._resource_limiter,
+                        runtime_seconds=server_runtime(engine),
                     )
                     hunter_endpoint = OpenCodeEndpoint(
                         private_server.endpoint.url,
@@ -897,6 +928,58 @@ class HunterExecutionMixin:
                             hunter_endpoint,
                             f"ollama/{engine.effective_model.removeprefix('ollama/')}",
                         )
+                    else:
+                        provider_auth = await private_server.wait_provider_auth(
+                            hunter_endpoint, engine.provider
+                        )
+                        if not provider_auth.enabled:
+                            provision = provision_provider_environment(
+                                private_spec,
+                                provider_auth.environment_names,
+                            )
+                            if provision.forwarded_names:
+                                await private_server.stop()
+                                private_server = None
+                                private_spec = provision.spec
+                                self._emit(
+                                    f"[{self._hunter_progress_name(engine)}] forwarding "
+                                    "private provider credential variable(s): "
+                                    + ", ".join(provision.forwarded_names)
+                                )
+                                private_server = await IsolatedOpenCodeServer.start(
+                                    private_spec,
+                                    artifact_dir=self.run_dir / "opencode-services" / engine.id,
+                                    resource_limiter=self._resource_limiter,
+                                    runtime_seconds=server_runtime(engine),
+                                )
+                                hunter_endpoint = OpenCodeEndpoint(
+                                    private_server.endpoint.url,
+                                    private_server.endpoint.password,
+                                    private_spec.cwd,
+                                )
+                                attached_spec = attach_server(
+                                    private_spec, hunter_endpoint
+                                )
+                                await private_server.wait_ready(hunter_endpoint)
+                                provider_auth = await private_server.wait_provider_auth(
+                                    hunter_endpoint, engine.provider
+                                )
+                            if not provider_auth.enabled:
+                                supported = ", ".join(
+                                    provider_auth.environment_names
+                                ) or "none"
+                                available = ", ".join(
+                                    provision.available_names
+                                ) or "none"
+                                raise ConfigError(
+                                    f"private OpenCode hunter {engine.id} cannot authenticate "
+                                    f"provider {engine.provider}; provider-supported environment "
+                                    f"variables: {supported}; available: {available}. Set a "
+                                    "provider API key in the host environment, configure a "
+                                    "reviewed pass_env variable, or use shared mode for an "
+                                    "OAuth/token-plan account. Swarmerz will not copy the "
+                                    "user's OpenCode credential database"
+                                )
                     self._emit(
                         f"[{self._hunter_progress_name(engine)}] private OpenCode workspace ready on "
                         f"{private_server.endpoint.url}"
@@ -915,8 +998,18 @@ class HunterExecutionMixin:
                 except (ConfigError, OSError) as exc:
                     return await startup_failure(str(exc))
                 finally:
-                    if private_server is not None:
-                        await private_server.stop()
+                    try:
+                        if private_server is not None:
+                            await private_server.stop()
+                    finally:
+                        if private_spec is not None:
+                            try:
+                                cleanup_private_opencode_state(private_spec)
+                            except (ConfigError, OSError) as exc:
+                                self._emit(
+                                    f"[security] [{self._hunter_progress_name(engine)}] "
+                                    f"private OpenCode credential-state cleanup failed: {exc}"
+                                )
 
             if service_template_spec is None:
                 raise ConfigError("native OpenCode service template is unavailable")
@@ -934,6 +1027,8 @@ class HunterExecutionMixin:
                         shared_server = await IsolatedOpenCodeServer.start(
                             service_template_spec,
                             artifact_dir=self.run_dir / "opencode-services" / "shared",
+                            resource_limiter=self._resource_limiter,
+                            runtime_seconds=shared_server_runtime,
                         )
                         self._emit(
                             "[setup] shared OpenCode service ready on "

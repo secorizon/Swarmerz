@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .models import CommandSpec, EngineConfig
+from .resource_limits import ResourceInvocation, ResourceLimiter
 from .storage import prepare_managed_environment
 
 
@@ -34,6 +35,8 @@ class CodexAppServer:
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._last_message = ""
+        self._resource_limiter: ResourceLimiter | None = None
+        self._resource_invocation: ResourceInvocation | None = None
 
     async def _send(self, message: dict[str, Any]) -> None:
         assert self.process is not None and self.process.stdin is not None
@@ -153,6 +156,7 @@ class CodexAppServer:
     async def start(
         self, spec: CommandSpec, engine: EngineConfig, *, stdout_path: Path,
         stderr_path: Path, emit: Callable[[str], None],
+        resource_limiter: ResourceLimiter | None = None,
     ) -> None:
         # The normal hunter command is `codex exec ... PROMPT`; retain its pinned
         # executable and environment, but use the documented live RPC transport.
@@ -166,8 +170,22 @@ class CodexAppServer:
             "-c", f"agents.max_concurrent_threads_per_session={engine.swarm_size}",
             *getattr(engine, "extra_args", ()),
         )
+        invocation = (
+            resource_limiter.prepare(
+                argv,
+                role=spec.env.get("SWARM_ROLE_ID", "codex"),
+                runtime_seconds=engine.timeout_seconds + 60,
+                environment=spec.env,
+            )
+            if resource_limiter is not None
+            else ResourceInvocation(argv)
+        )
+        self._resource_limiter = resource_limiter
+        self._resource_invocation = invocation
         self.process = await asyncio.create_subprocess_exec(
-            *argv, cwd=spec.cwd, env=spec.env, stdin=asyncio.subprocess.PIPE,
+            *invocation.argv, cwd=spec.cwd,
+            env=invocation.spawn_environment(spec.env),
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             start_new_session=True, limit=16 * 1024 * 1024,
         )
@@ -238,11 +256,19 @@ class CodexAppServer:
         if self.process is None:
             return
         if self.process.returncode is None:
+            if self._resource_limiter is not None and self._resource_invocation is not None:
+                await self._resource_limiter.signal_scope(
+                    self._resource_invocation, signal.SIGTERM
+                )
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(self.process.pid, signal.SIGTERM)
             try:
                 await asyncio.wait_for(self.process.wait(), timeout=5)
             except TimeoutError:
+                if self._resource_limiter is not None and self._resource_invocation is not None:
+                    await self._resource_limiter.signal_scope(
+                        self._resource_invocation, signal.SIGKILL
+                    )
                 with contextlib.suppress(ProcessLookupError):
                     os.killpg(self.process.pid, signal.SIGKILL)
                 await self.process.wait()

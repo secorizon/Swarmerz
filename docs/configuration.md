@@ -125,6 +125,38 @@ set.
 Both server modes run as the same operating-system user. Use containers or VMs when the audited code
 or model-driven tools may be hostile.
 
+## Resource-limit settings
+
+The optional `[resources]` table bounds accidental process and memory explosions independently of
+the model prompt.
+
+| Setting | Default | Meaning |
+|---|---:|---|
+| `resources.mode` | `auto` | `auto` uses Linux user-systemd scopes when available, `required` fails startup without them, and `off` disables operating-system ceilings. |
+| `resources.memory_max_gib` | `16` | Maximum resident memory charged to one harness scope. Zero disables this individual ceiling. |
+| `resources.memory_swap_max_gib` | `2` | Maximum swap charged to one harness scope. Zero disables this individual ceiling. |
+| `resources.tasks_max` | `512` | Maximum processes and threads in one harness scope. Zero disables this individual ceiling. |
+
+```toml
+[resources]
+mode = "auto"
+memory_max_gib = 16
+memory_swap_max_gib = 2
+tasks_max = 512
+```
+
+On Linux, Swarmerz verifies the user systemd manager before launching a harness. Each native Codex,
+command-adapter, and adjudicator process tree receives its own transient scope. A shared OpenCode
+service has one envelope covering all native OpenCode hunters attached to that service;
+`opencode_server_mode = "per_hunter"` gives each service a separate envelope. The controller stays
+outside these scopes, so a limit event can fail the affected harness without killing the deck.
+
+In `auto` mode, macOS and Linux installations without a usable user-systemd manager continue with
+process-group timeout cleanup and emit a warning. Use `required` when a deployment must refuse an
+uncontained mission. An instruction that explicitly requests fuzzing overrides the default prompt
+restriction, but it does not silently override operating-system ceilings. Raise the reviewed values
+or set `mode = "off"` for an intentionally larger campaign.
+
 ## Storage settings
 
 The `[storage]` table controls disposable build and dependency caches, not durable audit evidence.
@@ -148,9 +180,14 @@ Do not store API keys, session tokens, private keys, or passwords in the profile
 authenticated local session or list only the required variable names in `pass_env`. Unlisted host
 variables are not inherited when environment inheritance is disabled.
 
-Per-hunter OpenCode mode intentionally does not reuse the user's shared OpenCode auth store. Hosted
-routes in that mode need explicitly permitted credential variables or another reviewed authentication
-mechanism.
+Per-hunter OpenCode mode intentionally does not reuse the user's shared OpenCode auth store. Each
+private server reports the environment-variable names supported by its selected provider. Swarmerz
+forwards only matching non-empty values from the launch environment, then confirms that OpenCode
+registered the environment connection. Custom provider variables can still be named explicitly in
+`pass_env`. Swarmerz never imports, copies, or modifies the user's OpenCode credential database,
+and it removes each hunter's temporary OpenCode HOME and database when that hunter stops. A provider
+authenticated only through saved OAuth or token-plan state must use shared mode or a dedicated
+environment credential.
 
 ## One-run overrides
 

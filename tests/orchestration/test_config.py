@@ -21,6 +21,46 @@ from swarmerz.orchestration.runner import AuditRunner, _hunter_progress_name, _v
 
 
 class ConfigTests(unittest.TestCase):
+    def test_resource_limits_have_safe_defaults_and_explicit_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = self._write(root)
+            defaults = load_config(path).resources
+            self.assertEqual(defaults.mode, "auto")
+            self.assertEqual(defaults.memory_max_bytes, 16 * 1024**3)
+            self.assertEqual(defaults.memory_swap_max_bytes, 2 * 1024**3)
+            self.assertEqual(defaults.tasks_max, 512)
+
+            content = path.read_text(encoding="utf-8")
+            content = content.replace(
+                "max_parallel_hunters = 4",
+                """max_parallel_hunters = 4
+
+                [resources]
+                mode = "required"
+                memory_max_gib = 12.5
+                memory_swap_max_gib = 4
+                tasks_max = 900""",
+            )
+            path.write_text(content, encoding="utf-8")
+            configured = load_config(path).resources
+            self.assertEqual(configured.mode, "required")
+            self.assertEqual(configured.memory_max_bytes, int(12.5 * 1024**3))
+            self.assertEqual(configured.memory_swap_max_bytes, 4 * 1024**3)
+            self.assertEqual(configured.tasks_max, 900)
+
+    def test_resource_limits_reject_invalid_values(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = self._write(root)
+            content = path.read_text(encoding="utf-8").replace(
+                "max_parallel_hunters = 4",
+                "max_parallel_hunters = 4\n[resources]\nmode = \"unsafe\"",
+            )
+            path.write_text(content, encoding="utf-8")
+            with self.assertRaisesRegex(ConfigError, "resources.mode"):
+                load_config(path)
+
     def test_shipped_examples_pin_requested_harnesses_and_models(self) -> None:
         root = Path(__file__).resolve().parents[2]
         hosted = load_config(root / "swarmerz.toml")

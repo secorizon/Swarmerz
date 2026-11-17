@@ -311,6 +311,7 @@ and prompt paths are resolved from the selected configuration file.
 | `[analyzer]` | Fresh primary adjudicator; native Codex or a command adapter, with mandatory identity blinding and optional baseline-first review |
 | `[secondary_analyzer]` | Optional different model/provider confirmation gate; only confirmed primary findings carry forward |
 | `[isolation]` | Workspace environment policy and optional OpenCode server topology; unrestricted environment inheritance is off by default |
+| `[resources]` | Optional Linux user-scope memory, swap, and task ceilings; safe defaults apply when the table is omitted |
 | `[storage]` | SSD cache root, age/size limits, failed-scratch retention, maintenance cadence, and successful-workspace cleanup |
 | `opencode_*` | Worker monitoring, orphan recovery, consolidation, and timeout behavior |
 | `codex_*` | Native Codex transport retry count and delay |
@@ -330,10 +331,24 @@ in `pass_env`; unrelated host variables are not inherited unless explicitly allo
 `isolation.opencode_server_mode = "shared"` is the default. Native OpenCode parents use one private
 round service and password, with workspace routing for separation; this protects ordinary operation
 but is not a hostile-process boundary. The opt-in `"per_hunter"` mode starts a service with a
-separate password, `HOME`, and XDG state root for every native OpenCode parent. Hosted routes in
-that mode must use explicit `pass_env` or `env` credentials because the user's shared OpenCode auth
-store is intentionally unavailable. Even per-hunter mode is same-user application isolation; use
+separate password, `HOME`, and XDG state root for every native OpenCode parent. For hosted routes,
+Swarmerz reads the provider's supported environment-variable names from that private server and
+forwards only matching values from the launch environment. It never imports, copies, or modifies
+the user's shared OpenCode credential database. Private OpenCode state is removed when the hunter
+stops. OAuth or token-plan credentials that exist only in the user's shared database therefore
+remain available only in shared mode. Even per-hunter mode is same-user application isolation; use
 separate containers or VMs when running code that may be hostile.
+
+Linux missions also place harness process trees in transient user-systemd scopes when the user
+manager supports the required controls. The default envelope is 16 GiB RAM, 2 GiB swap, and 512
+tasks per harness scope. The Swarmerz controller remains outside those scopes. Shared OpenCode mode
+uses one envelope for its shared service; per-hunter mode uses one per service. In automatic mode,
+macOS and Linux systems without usable user scopes continue with process-group cleanup and report
+the missing containment instead of failing startup. When a restricted harness environment omits
+`DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR`, Swarmerz supplies them only to the
+`systemd-run` launcher and removes those additions before OpenCode, Codex, or a command adapter
+starts. These limits contain accidental recursion and runaway tests; they are not a hostile-code
+sandbox. Reviewed fuzzing campaigns can raise or disable the ceilings explicitly in `[resources]`.
 
 ### Scale and concurrency
 
@@ -645,6 +660,9 @@ without duplicating its file data.
 
 - Workspace isolation is an application boundary, not an operating-system sandbox against a
   malicious process with unrestricted host access. Use a hardened VM or container for hostile code.
+- Linux user-systemd resource scopes limit accidental memory and task explosions when available,
+  but they do not restrict filesystem, network, or same-user process access. Automatic fallback is
+  recorded in the round manifest.
 - A seal is local integrity bookkeeping: SHA-256 plus read-only file permissions. No external
   witness, transparency log, TPM, or remote attestation is implied.
 - Blind labels do not guarantee model anonymity, and a shared provider/model can retain correlated
@@ -677,6 +695,9 @@ without duplicating its file data.
   credit, and credential allowlist in `swarmerz.toml`.
 - **A hunter is `BLOCKED`:** inspect its `worker-monitor.json` and signal rail. Swarmerz will not
   grant new filesystem or credential access during an unattended run.
+- **A harness exits after a resource limit:** inspect `manifest.json` → `resource_limits`, the
+  harness result, and the system journal. Raise reviewed `[resources]` ceilings only when the
+  mission genuinely requires a larger bounded workload.
 - **Primary analysis failed after hunters sealed:** use `swarmerz analyze`; do not start a new round
   merely to retry adjudication.
 - **Follow-up chat appears idle:** current builds print `[Swarmerz] launching readable Codex

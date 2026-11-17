@@ -23,6 +23,7 @@ from .models import (
     EFFORTS,
     EngineConfig,
     IsolationConfig,
+    ResourceLimitsConfig,
     StorageConfig,
 )
 
@@ -234,6 +235,16 @@ def _optional_path(base: Path, value: Any) -> Path | None:
     return path
 
 
+def _resource_gib(value: Any, where: str) -> int:
+    try:
+        gib = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{where} must be a non-negative number") from exc
+    if not math.isfinite(gib) or gib < 0:
+        raise ConfigError(f"{where} must be a non-negative number")
+    return int(gib * 1024**3)
+
+
 def load_config(path: str | Path, overrides: list[str] | None = None) -> AppConfig:
     config_path = Path(path).expanduser().resolve()
     try:
@@ -303,6 +314,24 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> AppConf
     )
     if not isinstance(cleanup_successful_workspaces, bool):
         raise ConfigError("storage.cleanup_successful_workspaces must be true or false")
+
+    resources_table = raw.get("resources", {})
+    if not isinstance(resources_table, dict):
+        raise ConfigError("resources must be a table")
+    resources_mode = str(resources_table.get("mode", "auto")).lower()
+    if resources_mode not in {"auto", "required", "off"}:
+        raise ConfigError("resources.mode must be auto, required, or off")
+    resource_memory_max_bytes = _resource_gib(
+        resources_table.get("memory_max_gib", 16),
+        "resources.memory_max_gib",
+    )
+    resource_memory_swap_max_bytes = _resource_gib(
+        resources_table.get("memory_swap_max_gib", 2),
+        "resources.memory_swap_max_gib",
+    )
+    resource_tasks_max = int(resources_table.get("tasks_max", 512))
+    if resource_tasks_max < 0:
+        raise ConfigError("resources.tasks_max must be non-negative")
 
     context_table = raw.get("context", {})
     hunter_tables = _required(raw, "hunters", "root")
@@ -441,6 +470,12 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> AppConf
             mode=isolation_mode,
             inherit_environment=bool(isolation_table.get("inherit_environment", False)),
             opencode_server_mode=opencode_server_mode,
+        ),
+        resources=ResourceLimitsConfig(
+            mode=resources_mode,
+            memory_max_bytes=resource_memory_max_bytes,
+            memory_swap_max_bytes=resource_memory_swap_max_bytes,
+            tasks_max=resource_tasks_max,
         ),
         storage=StorageConfig(
             cache_root=cache_root,

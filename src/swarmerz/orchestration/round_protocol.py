@@ -26,6 +26,7 @@ async def execute_round_protocol(
     try:
         runner._initialize()
         runner._activate_managed_storage()
+        runner._activate_resource_limits()
         runner._update_manifest(status="setup")
         await runner._prepare_harnesses()
 

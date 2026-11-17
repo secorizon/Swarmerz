@@ -102,24 +102,28 @@ Check a deployment profile and all harnesses it requires:
 swarmerz doctor --config /absolute/path/to/swarmerz.toml
 ```
 
-Doctor verifies Python, supported platform, clipboard integration, Python dependencies, packaged
-schemas, and—when a profile is supplied—the configured harness executables. Warnings such as a
-missing optional clipboard helper return success. Missing required dependencies, schemas, platform
-support, or configured harnesses return failure.
+Doctor verifies Python, supported platform, clipboard integration, Linux resource-containment
+helpers, Python dependencies, packaged schemas, and—when a profile is supplied—the configured
+harness executables. Mission startup additionally exercises the user-systemd controls before any
+harness launches. Warnings such as a missing optional clipboard helper or unavailable automatic
+resource containment return success. Missing required dependencies, schemas, platform support,
+configured harnesses, or containment configured as `required` return failure.
 
 ## Platform notes
 
 ### Linux
 
 Run inside an interactive terminal. Keep the durable `output_root` and disposable cache on a local
-filesystem with normal POSIX permissions. A remote model endpoint is supported as long as its
-configured harness can reach it.
+filesystem with normal POSIX permissions. When user-systemd scopes are available, Swarmerz uses
+them for harness memory, swap, and task ceilings without placing the controller in the same scope.
+A remote model endpoint is supported as long as its configured harness can reach it.
 
 ### macOS
 
 Install Python and each configured harness for the same CPU architecture. `pbcopy` provides native
 clipboard integration. Package installation, doctor, the console command, and the test suite are
-covered by the macOS CI job.
+covered by the macOS CI job. Linux cgroup ceilings are unavailable; automatic mode keeps normal
+process-group timeout cleanup and does not block the mission.
 
 ### Windows through WSL2
 

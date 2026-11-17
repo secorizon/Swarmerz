@@ -91,7 +91,10 @@ required harnesses.
 swarmerz doctor [--config PATH] [--set PATH=VALUE] [--json]
 ```
 
-`doctor --set` requires `--config`. Clipboard warnings do not produce a failure exit status.
+`doctor --set` requires `--config`. Clipboard warnings and unavailable automatic resource
+containment do not produce a failure exit status. A profile using `resources.mode = "required"`
+does fail when the required platform helpers are absent; mission startup performs the definitive
+user-systemd capability probe.
 
 ## `demo`
 

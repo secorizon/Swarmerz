@@ -13,7 +13,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from .models import CommandSpec
+from .models import CommandSpec, ConfigError
+from .resource_limits import ResourceInvocation, ResourceLimiter
 from .storage import prepare_managed_environment
 
 
@@ -26,6 +27,7 @@ async def execute(
     on_output: Callable[[str, str], None] | None = None,
     append: bool = False,
     stop_event: asyncio.Event | None = None,
+    resource_limiter: ResourceLimiter | None = None,
 ) -> dict[str, Any]:
     stdout_path.parent.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
@@ -41,14 +43,38 @@ async def execute(
             "duration_seconds": round(time.monotonic() - started, 3),
             "error": f"unable to prepare managed storage: {exc}",
         }
+    try:
+        invocation = (
+            resource_limiter.prepare(
+                spec.argv,
+                role=spec.env.get("SWARM_ROLE_ID", "command"),
+                runtime_seconds=timeout_seconds + 30,
+                environment=spec.env,
+            )
+            if resource_limiter is not None
+            else ResourceInvocation(spec.argv)
+        )
+    except ConfigError as exc:
+        return {
+            "status": "failed_to_start",
+            "exit_code": None,
+            "timed_out": False,
+            "duration_seconds": round(time.monotonic() - started, 3),
+            "error": str(exc),
+        }
+    scope = (
+        {"resource_scope": invocation.unit_name}
+        if invocation.unit_name is not None
+        else {}
+    )
     mode = "ab" if append else "wb"
     with stdout_path.open(mode) as stdout_handle, stderr_path.open(mode) as stderr_handle:
         pump_tasks: list[asyncio.Task[None]] = []
         try:
             process = await asyncio.create_subprocess_exec(
-                *spec.argv,
+                *invocation.argv,
                 cwd=spec.cwd,
-                env=spec.env,
+                env=invocation.spawn_environment(spec.env),
                 stdout=asyncio.subprocess.PIPE if on_output is not None else stdout_handle,
                 stderr=asyncio.subprocess.PIPE if on_output is not None else stderr_handle,
                 start_new_session=True,
@@ -61,6 +87,7 @@ async def execute(
                 "timed_out": False,
                 "duration_seconds": round(time.monotonic() - started, 3),
                 "error": str(exc),
+                **scope,
             }
 
         async def pump(
@@ -87,18 +114,20 @@ async def execute(
         wait_task = asyncio.create_task(process.wait())
         stop_task = asyncio.create_task(stop_event.wait()) if stop_event is not None else None
 
-        async def terminate_process() -> int:
+        async def signal_process_tree(signal_to_send: signal.Signals) -> None:
+            if resource_limiter is not None:
+                await resource_limiter.signal_scope(invocation, signal_to_send)
             try:
-                os.killpg(process.pid, signal.SIGTERM)
+                os.killpg(process.pid, signal_to_send)
             except ProcessLookupError:
                 pass
+
+        async def terminate_process() -> int:
+            await signal_process_tree(signal.SIGTERM)
             try:
                 return await asyncio.wait_for(asyncio.shield(wait_task), timeout=10)
             except TimeoutError:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                await signal_process_tree(signal.SIGKILL)
                 return await wait_task
 
         try:
@@ -134,6 +163,7 @@ async def execute(
         "timed_out": timed_out,
         "stopped": stopped,
         "duration_seconds": round(time.monotonic() - started, 3),
+        **scope,
     }
 
 

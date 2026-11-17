@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
-from .orchestration.models import AppConfig, EngineConfig
+from .orchestration.models import AppConfig, EngineConfig, ResourceLimitsConfig
 
 
 @dataclass(frozen=True)
@@ -90,6 +90,45 @@ def _platform_diagnostic(platform_name: str) -> Diagnostic:
         "platform",
         "warn",
         f"untested platform {platform_name!r}; POSIX process and filesystem semantics are required",
+    )
+
+
+def _resource_diagnostic(
+    config: AppConfig | None,
+    *,
+    which: Callable[[str], str | None],
+    platform_name: str,
+) -> Diagnostic:
+    resources = config.resources if config is not None else ResourceLimitsConfig()
+    if resources.mode == "off":
+        return Diagnostic(
+            "resource-containment",
+            "info",
+            "disabled by resources.mode=off; process-group timeout cleanup remains active",
+        )
+    if not platform_name.startswith("linux"):
+        status = "error" if resources.mode == "required" else "info"
+        return Diagnostic(
+            "resource-containment",
+            status,
+            "systemd user scopes are Linux-only; process-group timeout cleanup remains active",
+        )
+    systemd_run = which("systemd-run")
+    systemctl = which("systemctl")
+    if not systemd_run or not systemctl:
+        status = "error" if resources.mode == "required" else "warn"
+        return Diagnostic(
+            "resource-containment",
+            status,
+            "systemd-run/systemctl unavailable; workloads cannot receive cgroup memory/task ceilings",
+        )
+    return Diagnostic(
+        "resource-containment",
+        "ok",
+        "Linux helpers available; mission startup verifies the user manager "
+        f"({resources.memory_max_bytes / 1024**3:g} GiB memory, "
+        f"{resources.memory_swap_max_bytes / 1024**3:g} GiB swap, "
+        f"{resources.tasks_max} tasks per harness scope)",
     )
 
 
@@ -201,6 +240,11 @@ def collect_diagnostics(
             f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
         ),
         _platform_diagnostic(current_platform),
+        _resource_diagnostic(
+            config,
+            which=find_executable,
+            platform_name=current_platform,
+        ),
         _clipboard_diagnostic(
             env=environment,
             which=find_executable,

@@ -148,6 +148,16 @@ Inspect the signal rail, `worker-monitor.json`, harness stderr, and any unresolv
 request. Swarmerz rejects unattended OpenCode permission escalation rather than silently granting
 access. Use `/wrap ID` to request consolidation if useful partial work exists.
 
+### Harness hit a resource ceiling
+
+Read `manifest.json` → `resource_limits`, the affected harness `result.json`, its stderr, and the
+system journal. Linux scopes keep the controller outside the failing workload, so other harnesses
+and durable artifacts can survive. A shared OpenCode service has one envelope for every attached
+native OpenCode hunter; a limit event can therefore stop that shared service. Increase
+`memory_max_gib`, `memory_swap_max_gib`, or `tasks_max` only after reviewing the workload. An
+explicit fuzzing instruction permits the model to fuzz, but operating-system ceilings remain until
+the deployment profile raises or disables them.
+
 ### Stored round is missing
 
 Use the same profile and `output_root` override that created the round. The archive picker reads the

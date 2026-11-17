@@ -44,7 +44,13 @@ from .fanout import (
 from .hunter_execution import HunterExecutionMixin
 from .local_context import instruction_for_workspace
 from .live_control import LiveControl
-from .models import AppConfig, CommandSpec, ConfigError, EngineConfig
+from .models import (
+    AppConfig,
+    CommandSpec,
+    ConfigError,
+    EngineConfig,
+    ResourceLimitsConfig,
+)
 from .ollama_probe import probe_ollama_model
 from .opencode_permissions import (
     OpenCodeEndpoint,
@@ -63,6 +69,7 @@ from .protocol_support import (
     utc_now as _utc_now,
 )
 from .round_protocol import execute_round_protocol
+from .resource_limits import ResourceLimiter
 from .session_context import (
     existing_context_source as _existing_context_source,
     resolve_context,
@@ -248,15 +255,6 @@ def _per_hunter_opencode_service_spec(
     """
     if engine.harness != "opencode" or engine.command:
         raise ConfigError("per-hunter OpenCode service requires a native OpenCode hunter")
-    explicit_names = set(engine.pass_env) | set(engine.env)
-    if engine.provider != "ollama" and not any(
-        name in spec.env for name in explicit_names
-    ):
-        raise ConfigError(
-            f"hunter {engine.id} uses stored OpenCode authentication, which is unavailable "
-            "with isolation.opencode_server_mode=per_hunter; configure explicit pass_env/env "
-            "credentials or use the shared service mode"
-        )
     env = dict(spec.env)
     scratch_value = env.get("SWARMERZ_SCRATCH_DIR")
     if not scratch_value:
@@ -663,7 +661,30 @@ class AuditRunner(SessionLifecycleMixin, HunterExecutionMixin, AdjudicationMixin
         return build_auth_probe_command(*args, **kwargs)
 
     async def _execute_command(self, spec: CommandSpec, **kwargs: Any) -> dict[str, Any]:
+        kwargs.setdefault("resource_limiter", self._resource_limiter)
         return await execute(spec, **kwargs)
+
+    def _activate_resource_limits(
+        self, *, manifest_key: str = "resource_limits"
+    ) -> None:
+        status = self._resource_limiter.activate()
+        if self.manifest:
+            self._update_manifest(**{manifest_key: status})
+        if status["enforced"]:
+            memory_gib = int(status["memory_max_bytes"]) / 1024**3
+            swap_gib = int(status["memory_swap_max_bytes"]) / 1024**3
+            self._emit(
+                "[resources] Linux user scopes enabled: "
+                f"{memory_gib:g} GiB memory, {swap_gib:g} GiB swap, "
+                f"{status['tasks_max']} tasks per harness scope"
+            )
+        elif status["mode"] == "off":
+            self._emit("[resources] operating-system workload limits disabled by configuration")
+        else:
+            self._emit(
+                "[resources] WARNING: operating-system workload limits unavailable; "
+                f"using process-group cleanup only ({status['detail']})"
+            )
 
     @staticmethod
     def _interrupt_worker_session() -> Callable[..., Any]:
@@ -707,6 +728,9 @@ class AuditRunner(SessionLifecycleMixin, HunterExecutionMixin, AdjudicationMixin
         self.session: dict[str, Any] = {}
         self._storage = StorageManager(config.storage) if hasattr(config, "storage") else None
         self._storage_active = False
+        self._resource_limiter = ResourceLimiter(
+            getattr(config, "resources", ResourceLimitsConfig(mode="off"))
+        )
         self.progress = progress
         self.hunter_report = hunter_report
         self.live_control = LiveControl({
@@ -793,6 +817,7 @@ class AuditRunner(SessionLifecycleMixin, HunterExecutionMixin, AdjudicationMixin
                 await client.start(
                     spec, engine, stdout_path=stdout_path, stderr_path=stderr_path,
                     emit=lambda message: self._emit(f"[{role}/live] {message}"),
+                    resource_limiter=self._resource_limiter,
                 )
                 self.live_control.register_codex(role, client)
                 result = await client.run(spec, engine)
@@ -815,7 +840,7 @@ class AuditRunner(SessionLifecycleMixin, HunterExecutionMixin, AdjudicationMixin
         result: dict[str, Any] = {}
 
         for attempt in range(retry_limit + 1):
-            result = await execute(
+            result = await self._execute_command(
                 spec,
                 timeout_seconds=engine.timeout_seconds,
                 stdout_path=stdout_path,
@@ -1291,7 +1316,7 @@ class AuditRunner(SessionLifecycleMixin, HunterExecutionMixin, AdjudicationMixin
 
         for attempt in range(provider_retry_limit + 1):
             stop_event = asyncio.Event()
-            run_task = asyncio.create_task(execute(
+            run_task = asyncio.create_task(self._execute_command(
                 spec,
                 timeout_seconds=self.config.opencode_finalize_timeout_seconds,
                 stdout_path=stdout_path,
@@ -1485,6 +1510,9 @@ class AuditRunner(SessionLifecycleMixin, HunterExecutionMixin, AdjudicationMixin
             )
             self.round_number = int(self.manifest["round_number"])
             self._activate_managed_storage()
+            self._activate_resource_limits(
+                manifest_key="analysis_retry_resource_limits"
+            )
 
             results_by_id = {
                 item["hunter_id"]: item

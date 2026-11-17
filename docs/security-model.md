@@ -22,6 +22,8 @@ does not turn model output into a security proof or provide an operating-system 
   explicit in durable artifacts.
 - Optional secondary verification must use a different provider or effective model.
 - Cache deletion is restricted to a marked dedicated cache root and never targets durable runs.
+- On Linux with a usable user systemd manager, harness trees receive configurable memory, swap, and
+  task ceilings in scopes separate from the Swarmerz controller.
 - Release artifacts are checked for operational profiles, tests, shell scripts, credential-like
   filenames, private-key headers, and common provider-token signatures.
 
@@ -29,6 +31,11 @@ does not turn model output into a security proof or provide an operating-system 
 
 - **Workspace separation is not hostile-process isolation.** All processes still run under the same
   operating-system user unless the deployment adds containers, VMs, or separate accounts.
+- **Resource ceilings are damage containment, not a sandbox.** Automatic mode degrades visibly to
+  process-group cleanup where Linux user scopes are unavailable. Shared OpenCode mode has one
+  resource envelope for its shared service rather than one envelope per hunter.
+  Swarmerz supplies the login's DBus address and XDG runtime directory only to the
+  `systemd-run` launcher when needed, then removes those additions before the harness starts.
 - **Read-only files are not external attestation.** Their owner can change permissions. Seals do not
   provide a transparency log, TPM measurement, or independent witness.
 - **Blind labels do not erase writing style.** A model can identify itself, cite a provider-specific
@@ -73,6 +80,15 @@ state and should not contain credentials.
 
 An Ollama endpoint URL cannot contain embedded username/password data. Per-hunter OpenCode isolation
 uses private state roots and therefore does not silently reuse the user's global OpenCode auth store.
+For hosted providers, Swarmerz queries the private server's integration metadata and forwards only
+the provider-declared variables that are present in the launch environment. It does not read or copy
+the global OpenCode database. The temporary private HOME and database are removed when the hunter
+stops, including handled startup failures.
+
+Environment credentials are still visible to processes running as the same user and may count
+against the same provider billing and rate limits. Per-hunter state separation is not a secret
+boundary against hostile model-driven commands; use separate OS identities, containers, or VMs for
+that threat model.
 
 Before freezing a repository, exclude credentials, local environment files, private keys, cloud
 profiles, signing material, and unrelated proprietary data. Hidden files receive no automatic trust.

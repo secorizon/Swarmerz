@@ -24,6 +24,7 @@ from swarmerz.orchestration.hunter_execution import (
 )
 from swarmerz.orchestration.models import CommandSpec, ConfigError, StorageConfig
 from swarmerz.orchestration.opencode_permissions import OpenCodeEndpoint
+from swarmerz.orchestration.opencode_server import OpenCodeProviderAuth
 from swarmerz.orchestration.runner import (
     AuditRunner, _diagnostic_tail, _settled_partial_answer,
     _wait_for_stable_final_answer,
@@ -1256,6 +1257,180 @@ class IntegrationTests(unittest.TestCase):
                 "parent provider failed before launching workers" in item
                 for item in progress
             ))
+
+    def test_per_hunter_opencode_forwards_provider_key_and_removes_private_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_opencode = root / "opencode"
+            fake_opencode.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!{sys.executable}
+                    import json, pathlib, sys
+
+                    args = sys.argv[1:]
+                    parent = "parent-" + pathlib.Path.cwd().name
+                    if args == ["--version"]:
+                        print("opencode v2.3.0")
+                    elif args and args[0] == "run":
+                        print(json.dumps({{"type": "step_start", "sessionID": parent}}), flush=True)
+                        print(json.dumps({{
+                            "type": "error",
+                            "sessionID": parent,
+                            "error": {{
+                                "type": "provider.no-route",
+                                "message": "test route unavailable"
+                            }}
+                        }}), flush=True)
+                        raise SystemExit(1)
+                    else:
+                        raise SystemExit("unexpected fake OpenCode arguments: " + repr(args))
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_opencode.chmod(0o755)
+
+            config_path = root / "swarm.toml"
+            config_path.write_text(
+                textwrap.dedent(
+                    f"""
+                    schema_version = 1
+                    output_root = "{root / 'runs'}"
+                    minimum_answers = 2
+                    opencode_worker_timeout_seconds = 2
+                    opencode_worker_poll_seconds = 1
+                    opencode_finalize_timeout_seconds = 2
+
+                    [storage]
+                    cache_root = "{root / 'cache'}"
+
+                    [resources]
+                    mode = "off"
+
+                    [isolation]
+                    mode = "workspace"
+                    inherit_environment = false
+                    opencode_server_mode = "per_hunter"
+
+                    [[hunters]]
+                    id = "grok"
+                    harness = "opencode"
+                    harness_version = "2.3.0"
+                    provider = "xai"
+                    model = "grok-test"
+                    reasoning_effort = "default"
+                    supported_efforts = ["default"]
+                    timeout_seconds = 5
+                    workers = 2
+                    subagents = 2
+                    pass_env = []
+
+                    [[hunters]]
+                    id = "control"
+                    harness = "command"
+                    harness_version = "test"
+                    provider = "test"
+                    model = "test"
+                    reasoning_effort = "low"
+                    supported_efforts = ["low"]
+                    workers = 2
+                    command = ["/bin/false"]
+
+                    [analyzer]
+                    id = "unused-analyzer"
+                    harness = "command"
+                    harness_version = "test"
+                    provider = "test"
+                    model = "test"
+                    reasoning_effort = "low"
+                    supported_efforts = ["low"]
+                    command = ["/bin/false"]
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            server_specs: list[CommandSpec] = []
+
+            class FakeServer:
+                endpoint = OpenCodeEndpoint(
+                    "http://127.0.0.1:40001", "test-password"
+                )
+                stderr_path = root / "fake-server.stderr.log"
+
+                def __init__(self, spec: CommandSpec) -> None:
+                    self.spec = spec
+
+                async def wait_ready(self, endpoint: OpenCodeEndpoint) -> None:
+                    self.assert_private_directory(endpoint)
+
+                @staticmethod
+                def assert_private_directory(endpoint: OpenCodeEndpoint) -> None:
+                    assert endpoint.directory is not None
+
+                async def wait_provider_auth(
+                    self,
+                    _endpoint: OpenCodeEndpoint,
+                    provider_id: str,
+                ) -> OpenCodeProviderAuth:
+                    assert provider_id == "xai"
+                    return OpenCodeProviderAuth(
+                        ("XAI_API_KEY",),
+                        bool(self.spec.env.get("XAI_API_KEY")),
+                    )
+
+                async def stop(self) -> None:
+                    return None
+
+            async def fake_start(
+                spec: CommandSpec, **_kwargs: object
+            ) -> FakeServer:
+                server_specs.append(spec)
+                return FakeServer(spec)
+
+            test_env = {
+                "PATH": f"{root}:{os.environ.get('PATH', '')}",
+                "XAI_API_KEY": "test-only-private-key",
+            }
+            with mock.patch.dict(os.environ, test_env), mock.patch(
+                "swarmerz.orchestration.runner.list_worker_sessions",
+                return_value={"data": []},
+            ), mock.patch(
+                "swarmerz.orchestration.runner.IsolatedOpenCodeServer.start",
+                side_effect=fake_start,
+            ):
+                run_dir = asyncio.run(
+                    AuditRunner(
+                        load_config(config_path),
+                        "private credential lifecycle",
+                        session_id="private-credential",
+                        round_id="first",
+                    ).run()
+                )
+
+            self.assertEqual(len(server_specs), 2)
+            self.assertNotIn("XAI_API_KEY", server_specs[0].env)
+            self.assertEqual(
+                server_specs[1].env["XAI_API_KEY"], "test-only-private-key"
+            )
+            private_root = Path(server_specs[1].env["HOME"]).parent
+            self.assertFalse(private_root.exists())
+            manifest = json.loads((run_dir / "manifest.json").read_text())
+            grok = next(
+                item
+                for item in manifest["hunter_results"]
+                if item["hunter_id"] == "grok"
+            )
+            self.assertEqual(grok["status"], "failed")
+            self.assertTrue(grok["isolated_server"]["private_home_and_state"])
+            for artifact in run_dir.rglob("*"):
+                if artifact.is_file():
+                    self.assertNotIn(
+                        b"test-only-private-key",
+                        artifact.read_bytes(),
+                        str(artifact),
+                    )
 
     def test_native_opencode_monitors_workers_and_replaces_provisional_answer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

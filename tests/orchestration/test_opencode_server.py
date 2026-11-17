@@ -15,7 +15,13 @@ from swarmerz.orchestration.artifacts import collect_partial_notes
 from swarmerz.orchestration.models import CommandSpec, ConfigError
 from swarmerz.orchestration.opencode_permissions import OpenCodeEndpoint
 from swarmerz.orchestration.opencode_server import (
-    IsolatedOpenCodeServer, _server_has_model, _server_ready, attach_server,
+    IsolatedOpenCodeServer,
+    _async_server_provider_auth,
+    _server_has_model,
+    _server_ready,
+    attach_server,
+    cleanup_private_opencode_state,
+    provision_provider_environment,
 )
 from swarmerz.orchestration.runner import (
     _opencode_round_slot,
@@ -52,6 +58,39 @@ class IsolatedServerTests(unittest.TestCase):
         request = open_url.call_args.args[0]
         self.assertEqual(request.full_url, "http://127.0.0.1:42001/api/model?providerID=ollama")
         self.assertEqual(request.get_header("X-opencode-directory"), "/tmp/ollama-hunter")
+
+    def test_provider_auth_reads_only_safe_environment_names(self) -> None:
+        async def exercise() -> None:
+            endpoint = OpenCodeEndpoint(
+                "http://127.0.0.1:42001", "private-password", Path("/tmp/hunter-one")
+            )
+            payload = json.dumps({
+                "data": {
+                    "methods": [
+                        {"type": "key"},
+                        {
+                            "type": "env",
+                            "names": [
+                                "XAI_API_KEY",
+                                "XAI_API_KEY",
+                                "XAI-INVALID",
+                                "1INVALID",
+                            ],
+                        },
+                    ],
+                    "connections": [{"type": "env", "name": "XAI_API_KEY"}],
+                }
+            }).encode()
+            with mock.patch(
+                "swarmerz.orchestration.opencode_server._async_service_request",
+                new=mock.AsyncMock(return_value=(200, payload)),
+            ) as request:
+                auth = await _async_server_provider_auth(endpoint, "xai")
+            self.assertEqual(auth.environment_names, ("XAI_API_KEY",))
+            self.assertTrue(auth.enabled)
+            self.assertEqual(request.await_args.args[1], "/api/integration/xai")
+
+        asyncio.run(exercise())
 
     def test_workspace_readiness_retries_without_starting_a_second_service(self) -> None:
         async def exercise() -> None:
@@ -295,7 +334,7 @@ class IsolatedServerTests(unittest.TestCase):
                 "http://127.0.0.1:11434/v1",
             )
 
-    def test_per_hunter_hosted_service_requires_explicit_credentials(self) -> None:
+    def test_per_hunter_hosted_service_can_probe_without_global_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             spec = CommandSpec(
@@ -308,8 +347,50 @@ class IsolatedServerTests(unittest.TestCase):
                 id="hosted-a", harness="opencode", command=(), provider="hosted",
                 pass_env=(), env={}, effective_model="model", ollama_base_url=None,
             )
-            with self.assertRaisesRegex(ConfigError, "stored OpenCode authentication"):
-                _per_hunter_opencode_service_spec(engine, spec)
+            private = _per_hunter_opencode_service_spec(engine, spec)
+            self.assertTrue(Path(private.env["HOME"]).is_dir())
+            self.assertNotEqual(private.env["HOME"], str(Path.home()))
+
+    def test_private_provider_environment_is_minimal_and_state_is_deleted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scratch = root / "scratch"
+            spec = CommandSpec(
+                ("opencode", "run", "prompt"),
+                root,
+                {
+                    "PATH": "/usr/bin",
+                    "SWARMERZ_SCRATCH_DIR": str(scratch),
+                },
+                None,
+            )
+            engine = mock.Mock(
+                id="hosted-a", harness="opencode", command=(), provider="xai",
+                pass_env=(), env={}, effective_model="model", ollama_base_url=None,
+            )
+            private = _per_hunter_opencode_service_spec(engine, spec)
+            provision = provision_provider_environment(
+                private,
+                ("XAI_API_KEY", "XAI_BASE_URL"),
+                environ={
+                    "XAI_API_KEY": "test-key",
+                    "UNRELATED_API_KEY": "must-not-pass",
+                },
+            )
+            self.assertEqual(provision.forwarded_names, ("XAI_API_KEY",))
+            self.assertEqual(provision.available_names, ("XAI_API_KEY",))
+            self.assertEqual(provision.spec.env["XAI_API_KEY"], "test-key")
+            self.assertNotIn("UNRELATED_API_KEY", provision.spec.env)
+            self.assertNotIn("XAI_API_KEY", private.env)
+
+            data_root = Path(provision.spec.env["XDG_DATA_HOME"])
+            (data_root / "opencode").mkdir(parents=True)
+            (data_root / "opencode" / "opencode.db").write_bytes(b"private-state")
+            survivor = scratch / "keep.txt"
+            survivor.write_text("retain other scratch", encoding="utf-8")
+            cleanup_private_opencode_state(provision.spec)
+            self.assertFalse((scratch / "opencode-isolation").exists())
+            self.assertEqual(survivor.read_text(encoding="utf-8"), "retain other scratch")
 
     def test_collects_only_regular_small_notes_without_sealing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

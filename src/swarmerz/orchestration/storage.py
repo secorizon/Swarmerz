@@ -124,6 +124,11 @@ def _remove_tree(path: Path, root: Path) -> None:
         shutil.rmtree(path)
 
 
+def remove_managed_subtree(path: Path, root: Path) -> None:
+    """Remove one validated subtree without relaxing the surrounding root."""
+    _remove_tree(path, root)
+
+
 def _remove_empty_directories(root: Path) -> None:
     if not root.is_dir() or root.is_symlink():
         return
