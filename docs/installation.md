@@ -8,7 +8,7 @@ This file is part of Swarmerz, a terminal operations deck for independent model 
 
 Swarmerz requires Python 3.12 or newer. It is supported directly on Linux and macOS; Windows users
 should run it inside WSL2. Native Windows is not supported because the runtime relies on POSIX
-signals, permissions, hardlinks, and terminal behavior.
+signals, permissions, and terminal behavior.
 
 Swarmerz is not published automatically as part of the release preparation process. Until a release
 is explicitly approved and published, install from a reviewed checkout or a locally built wheel.

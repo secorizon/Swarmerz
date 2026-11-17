@@ -19,10 +19,10 @@ This documentation describes the Swarmerz 0.1 release line. The root
 
 Swarmerz completes four software stages:
 
-1. Freeze the selected evidence and record its integrity metadata.
+1. Freeze the selected evidence, record its integrity metadata, and stage inode-independent views.
 2. Launch the configured independent hunter parents and their worker fan-out.
-3. Validate, seal, and blind structured hunter answers; continue when the configured quorum is met.
-4. Give the sealed reports to a fresh reviewer/judge, which emits the final report.
+3. Validate, seal, freshly shuffle, and blind structured hunter answers; continue when the configured quorum is met.
+4. Give the sealed reports and captured evidence to a fresh reviewer/judge in opaque staging, which emits the final report.
 
 An optional pre-hunt baseline and an optional secondary machine verifier can be configured, but
 neither changes the four-stage default workflow. Human review begins after Swarmerz emits its final

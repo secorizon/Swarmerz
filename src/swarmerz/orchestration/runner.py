@@ -26,9 +26,11 @@ from .adapters import (
 from .adjudication import AdjudicationMixin
 from .artifacts import (
     attribute_analysis,
+    randomized_answer_order,
     read_json,
     seal_answer,
     sha256_file,
+    verified_reproduction_references,
     write_final_report,
     write_json,
 )
@@ -98,11 +100,11 @@ _PROVENANCE_CLASSES = {
 _VALIDATION_METHODS = {"executed_reproduction", "source_inspection", "reasoning_only"}
 
 
-def _valid_evidence_contract(record: Any) -> bool:
+def _valid_evidence_contract(record: Any, workspace: Path | None = None) -> bool:
     if not isinstance(record, dict):
         return False
     reproduction = record.get("reproduction")
-    return (
+    structurally_valid = (
         record.get("provenance_class") in _PROVENANCE_CLASSES
         and record.get("validation_method") in _VALIDATION_METHODS
         and isinstance(reproduction, dict)
@@ -112,6 +114,12 @@ def _valid_evidence_contract(record: Any) -> bool:
         and bool(reproduction["observed_result"].strip())
         and isinstance(reproduction.get("artifact_refs"), list)
         and all(isinstance(item, str) for item in reproduction["artifact_refs"])
+    )
+    if not structurally_valid:
+        return False
+    return (
+        workspace is None
+        or verified_reproduction_references(record, workspace) is not None
     )
 
 
@@ -733,6 +741,7 @@ class AuditRunner(SessionLifecycleMixin, HunterExecutionMixin, AdjudicationMixin
         self.session: dict[str, Any] = {}
         self._storage = StorageManager(config.storage) if hasattr(config, "storage") else None
         self._storage_active = False
+        self._adjudication_workspaces: list[tuple[Path, Path, str]] = []
         self._resource_limiter = ResourceLimiter(
             getattr(config, "resources", ResourceLimitsConfig(mode="off"))
         )
@@ -1601,6 +1610,7 @@ class AuditRunner(SessionLifecycleMixin, HunterExecutionMixin, AdjudicationMixin
             self._activate_resource_limits(
                 manifest_key="analysis_retry_resource_limits"
             )
+            self._verify_context_snapshot("analysis-retry-start")
 
             results_by_id = {
                 item["hunter_id"]: item
@@ -1623,6 +1633,8 @@ class AuditRunner(SessionLifecycleMixin, HunterExecutionMixin, AdjudicationMixin
                     raise ConfigError(f"sealed answer changed: {hunter_id}")
                 answers.append({"hunter_id": hunter_id, "answer": read_json(answer_path), "sha256": digest})
 
+            answers = randomized_answer_order(answers)
+
             required = int(self.manifest.get("required_answer_count", len(original_hunters)))
             if len(answers) < required:
                 raise ConfigError(f"analysis quorum requires {required} sealed answers; found {len(answers)}")
@@ -1632,7 +1644,10 @@ class AuditRunner(SessionLifecycleMixin, HunterExecutionMixin, AdjudicationMixin
                 analysis_dir / name
                 for name in (
                     "analysis.json", "accepted-analysis.json", "stdout.jsonl", "stderr.log",
-                    "result.json", "launch.json", "instruction.md",
+                    "result.json", "launch.json", "instruction.md", "blind-answers.json",
+                    "blind-evidence-index.json", "answer-map.json",
+                    "reproduction-seal.json", "evidence",
+                    "evidence-manifest.json",
                 )
                 if (analysis_dir / name).exists()
             ]
@@ -1666,6 +1681,7 @@ class AuditRunner(SessionLifecycleMixin, HunterExecutionMixin, AdjudicationMixin
             verifier_result: dict[str, Any] | None = None
             if analysis is not None and self.config.secondary_analyzer is not None:
                 verification, verifier_result = await self._run_secondary_verifier(answers, analysis)
+            self._verify_context_snapshot("analysis-retry-finish")
             accepted_analysis = (
                 self._accepted_analysis(analysis, verification)
                 if analysis is not None
@@ -1700,7 +1716,6 @@ class AuditRunner(SessionLifecycleMixin, HunterExecutionMixin, AdjudicationMixin
                     if result.get("answer_sealed")
                 ],
             )
-            self._save_review_context(final_analysis)
             status = (
                 "completed"
                 if accepted_analysis is not None

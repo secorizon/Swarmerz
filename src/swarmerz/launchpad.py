@@ -33,9 +33,9 @@ _MODES = ("codebase", "raw")
 def _existing_local_paths(text: str) -> list[str]:
     """Absolute paths in the instruction that exist on this machine.
 
-    Hunters work inside isolated workspaces and cannot read outside them
-    without permission prompts, so a raw mission must not reference local
-    paths. The core enforces this at launch; preflight warns earlier.
+    Raw missions do not stage local evidence into hunter workspaces, so they
+    must not depend on local paths. The core enforces this protocol boundary;
+    it is not an operating-system claim about a hostile same-user process.
     """
     found = []
     for match in _LOCAL_PATH.findall(text):
@@ -291,8 +291,8 @@ class LaunchpadApp:
             leaked = _existing_local_paths(raw)
             if leaked:
                 self.notice = (
-                    f"Instruction references local path {leaked[0]}; hunters cannot read "
-                    "outside frozen workspaces. Ctrl-B to pick CODEBASE, or remove the path."
+                    f"Instruction references local path {leaked[0]}, but RAW mode does not "
+                    "stage local files. Ctrl-B to pick CODEBASE, or remove the path."
                 )
                 return False
         self.values["instruction"] = raw
@@ -352,7 +352,7 @@ class LaunchpadApp:
         if self.values["mode"] == "raw":
             rows.extend([
                 ("class:muted", " ○  CONTEXT\n"),
-                ("class:muted", "    skipped — hunters work in isolated workspaces\n\n"),
+                ("class:muted", "    skipped — RAW mode stages no local files\n\n"),
             ])
         rows.extend([
             ("class:muted", "EXECUTION\n"),

@@ -33,6 +33,172 @@ from swarmerz.review import chat
 
 
 class IntegrationTests(unittest.TestCase):
+    def test_hunter_mutation_cannot_taint_peer_snapshot_or_blind_judge(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            context = root / "target"
+            context.mkdir()
+            (context / "file.c").write_text("original\n", encoding="utf-8")
+
+            hunter_script = root / "hunter.py"
+            hunter_script.write_text(
+                textwrap.dedent(
+                    """
+                    import json, pathlib, sys, time
+                    hunter_id, workspace_arg, answer_arg = sys.argv[1:]
+                    workspace = pathlib.Path(workspace_arg)
+                    target = workspace / "context" / "file.c"
+                    if hunter_id == "alpha":
+                        target.chmod(0o644)
+                        target.write_text("planted\\n")
+                    else:
+                        time.sleep(0.4)
+                    observed = target.read_text().strip()
+                    answer = pathlib.Path(answer_arg)
+                    answer.parent.mkdir(parents=True, exist_ok=True)
+                    answer.write_text(json.dumps({
+                        "answer": f"{hunter_id}:{observed}",
+                        "key_points": [], "assumptions": [], "uncertainties": [],
+                        "sources": ["context/file.c"],
+                        "workstreams": [
+                            {"name": "one", "scope": "read", "conclusion": observed},
+                            {"name": "two", "scope": "compare", "conclusion": observed}
+                        ],
+                        "confidence": 0.8
+                    }))
+                    evidence = answer.parent / "worker-evidence.txt"
+                    evidence.write_text(observed)
+                    (answer.parent / "worker-ledger.json").write_text(json.dumps({
+                        "workers": [
+                            {"worker_id": "one", "scope": "read", "status": "completed", "evidence_refs": [".swarm/worker-evidence.txt"]},
+                            {"worker_id": "two", "scope": "compare", "status": "completed", "evidence_refs": [".swarm/worker-evidence.txt"]}
+                        ]
+                    }))
+                    """
+                ),
+                encoding="utf-8",
+            )
+            analyzer_script = root / "analyzer.py"
+            analyzer_script.write_text(
+                textwrap.dedent(
+                    """
+                    import json, pathlib, sys
+                    workspace = pathlib.Path(sys.argv[1])
+                    answers_path = pathlib.Path(sys.argv[2])
+                    result = pathlib.Path(sys.argv[3])
+                    bundle = json.loads(answers_path.read_text())
+                    values = [item["response"]["answer"] for item in bundle["answers"]]
+                    nearby_identity_trees = any(
+                        (ancestor / name).exists()
+                        for ancestor in list(workspace.parents)[:4]
+                        for name in ("hunters", "roles")
+                    )
+                    result.parent.mkdir(parents=True, exist_ok=True)
+                    result.write_text(json.dumps({
+                        "summary": "blind stage verified",
+                        "agreement": [], "disagreements": [],
+                        "answer_assessments": [
+                            {"answer_id": item["answer_id"], "strengths": [], "weaknesses": [], "factual_risks": []}
+                            for item in bundle["answers"]
+                        ],
+                        "validated_findings": [], "unresolved_questions": [],
+                        "recommended_answer": json.dumps({
+                            "judge_context": (workspace / "context" / "file.c").read_text().strip(),
+                            "relative_hunter_artifacts_visible": nearby_identity_trees,
+                            "answers": values
+                        }, sort_keys=True),
+                        "confidence": 0.8
+                    }))
+                    """
+                ),
+                encoding="utf-8",
+            )
+            hunters = "".join(
+                textwrap.dedent(
+                    f"""
+                    [[hunters]]
+                    id = "{hunter_id}"
+                    harness = "command"
+                    harness_version = "1"
+                    provider = "test"
+                    model = "{hunter_id}"
+                    reasoning_effort = "low"
+                    supported_efforts = ["low"]
+                    workers = 2
+                    command = ["{sys.executable}", "{hunter_script}", "{hunter_id}", "{{workspace}}", "{{answer}}"]
+                    """
+                )
+                for hunter_id in ("alpha", "beta")
+            )
+            config_path = root / "swarm.toml"
+            config_path.write_text(
+                textwrap.dedent(
+                    f"""
+                    schema_version = 1
+                    output_root = "{root / 'runs'}"
+                    max_parallel_hunters = 2
+                    minimum_answers = 2
+
+                    [storage]
+                    cache_root = "{root / 'cache'}"
+
+                    [resources]
+                    mode = "off"
+
+                    {hunters}
+
+                    [analyzer]
+                    id = "judge"
+                    harness = "command"
+                    harness_version = "1"
+                    provider = "judge-provider"
+                    model = "judge-model"
+                    reasoning_effort = "high"
+                    supported_efforts = ["high"]
+                    command = ["{sys.executable}", "{analyzer_script}", "{{workspace}}", "{{answers}}", "{{result}}"]
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            run_dir = asyncio.run(
+                AuditRunner(
+                    load_config(config_path),
+                    "review the target",
+                    context_override=context,
+                    session_id="isolation",
+                    round_id="first",
+                ).run()
+            )
+            manifest = json.loads((run_dir / "manifest.json").read_text())
+            self.assertEqual(manifest["status"], "completed", json.dumps(manifest, indent=2))
+            self.assertTrue(all(
+                item["passed"] for item in manifest["context"]["integrity_checks"]
+            ))
+            final_answers = {
+                item["hunter_id"]: item["answer"]["answer"]
+                for item in json.loads((run_dir / "final" / "answers.json").read_text())
+            }
+            self.assertEqual(final_answers["alpha"], "alpha:planted")
+            self.assertEqual(final_answers["beta"], "beta:original")
+            analysis = json.loads((run_dir / "final" / "analysis.json").read_text())
+            recommendation = json.loads(analysis["recommended_answer"])
+            self.assertEqual(recommendation["judge_context"], "original")
+            self.assertFalse(recommendation["relative_hunter_artifacts_visible"])
+            snapshot = root / "runs" / "sessions" / "isolation" / "input" / "context" / "file.c"
+            self.assertEqual(snapshot.read_text(encoding="utf-8"), "original\n")
+            snapshot.chmod(0o644)
+            snapshot.write_text("corrupted\n", encoding="utf-8")
+            with self.assertRaisesRegex(ConfigError, "frozen context integrity mismatch"):
+                asyncio.run(
+                    AuditRunner(
+                        load_config(config_path),
+                        "continue the review",
+                        session_id="isolation",
+                        round_id="second",
+                    ).run()
+                )
+
     def test_generic_provider_failure_requires_a_verified_empty_worker_set(self) -> None:
         failed = {"status": "failed"}
         diagnostic = "provider.internal: upstream gRPC error"
@@ -64,6 +230,9 @@ class IntegrationTests(unittest.TestCase):
     def test_baseline_first_and_secondary_confirmation_gate_findings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            context = root / "target"
+            context.mkdir()
+            (context / "file.c").write_text("int target(void) { return 0; }\n", encoding="utf-8")
             hunter_script = root / "hunter.py"
             hunter_script.write_text(
                 textwrap.dedent(
@@ -216,6 +385,7 @@ class IntegrationTests(unittest.TestCase):
                 AuditRunner(
                     load_config(config_path),
                     "review this target",
+                    context_override=context,
                     session_id="dual",
                     round_id="first",
                 ).run()
@@ -965,6 +1135,9 @@ class IntegrationTests(unittest.TestCase):
             context_file = root / "sessions" / "review" / "input" / "context" / "source.c"
             context_file.parent.mkdir(parents=True)
             context_file.write_text("int main(void) {}\n", encoding="utf-8")
+            legacy_context = run_dir / "workspaces" / "analyzer" / "context"
+            legacy_context.mkdir(parents=True)
+            os.link(context_file, legacy_context / "source.c")
             (run_dir / "manifest.json").write_text(
                 json.dumps({"session_id": "review", "round_id": "first", "status": "completed"}),
                 encoding="utf-8",
@@ -993,10 +1166,13 @@ class IntegrationTests(unittest.TestCase):
             self.assertTrue((private / "answer-map.json").is_file())
             self.assertTrue((private / "answers.json").is_file())
             linked_context = run_dir / "workspaces" / "analyzer" / "context" / "source.c"
-            self.assertEqual(
+            self.assertNotEqual(
                 (context_file.stat().st_dev, context_file.stat().st_ino),
                 (linked_context.stat().st_dev, linked_context.stat().st_ino),
             )
+            linked_context.chmod(0o644)
+            linked_context.write_text("changed only in review\n", encoding="utf-8")
+            self.assertEqual(context_file.read_text(), "int main(void) {}\n")
             output = io.StringIO()
             with mock.patch(
                 "swarmerz.review.shutil.which",
@@ -2029,6 +2205,9 @@ class IntegrationTests(unittest.TestCase):
                     assert [item["answer_id"] for item in bundle["answers"]] == ["A", "B", "C", "D"]
                     assert all("provider" not in item["response"] for item in bundle["answers"])
                     result_path.parent.mkdir(parents=True, exist_ok=True)
+                    reproduction = workspace / ".swarm" / "artifacts" / "reproduction.txt"
+                    reproduction.parent.mkdir(parents=True, exist_ok=True)
+                    reproduction.write_text("reproduction succeeds")
                     result_path.write_text(json.dumps({
                         "summary": f"reviewed four; prior={len(history['prior_rounds'])}",
                         "agreement": ["all answered"],
@@ -2049,7 +2228,7 @@ class IntegrationTests(unittest.TestCase):
                                 "reproduction": {
                                     "commands": ["test-command"],
                                     "observed_result": "reproduction succeeds",
-                                    "artifact_refs": []
+                                    "artifact_refs": [".swarm/artifacts/reproduction.txt"]
                                 }
                             }
                         ],
@@ -2148,9 +2327,20 @@ class IntegrationTests(unittest.TestCase):
             ))
             analysis = json.loads((second_dir / "final" / "analysis.json").read_text())
             self.assertEqual(analysis["summary"], "reviewed four; prior=1")
-            self.assertEqual(analysis["validated_findings"][0]["title"], "[ONE, THREE]: Example issue")
-            self.assertEqual(analysis["validated_findings"][0]["source_hunters"], ["ONE", "THREE"])
-            self.assertIn("### [ONE, THREE]: Example issue", analysis["recommended_answer"])
+            answer_map = json.loads((second_dir / "analysis" / "answer-map.json").read_text())
+            expected_hunters = [answer_map["A"].upper(), answer_map["C"].upper()]
+            expected_prefix = ", ".join(expected_hunters)
+            self.assertEqual(
+                analysis["validated_findings"][0]["title"],
+                f"[{expected_prefix}]: Example issue",
+            )
+            self.assertEqual(
+                analysis["validated_findings"][0]["source_hunters"], expected_hunters
+            )
+            self.assertIn(
+                f"### [{expected_prefix}]: Example issue",
+                analysis["recommended_answer"],
+            )
 
             session = json.loads((root / "runs" / "sessions" / "same-subject" / "session.json").read_text())
             self.assertEqual([item["status"] for item in session["rounds"]], ["completed", "completed"])
@@ -2175,7 +2365,9 @@ class IntegrationTests(unittest.TestCase):
                     (second_dir / "hunters" / hunter_id / "evidence-manifest.json").read_text()
                 )
                 self.assertEqual(evidence_manifest["artifact_count"], 1)
-            self.assertTrue(any("no duplicate file data" in message for message in progress))
+            self.assertTrue(
+                any("independent context staged" in message for message in progress)
+            )
             self.assertTrue(any("disposable workspace files" in message for message in progress))
             self.assertTrue(any("launching 4" in message for message in progress))
             self.assertTrue(any("primary analysis] completed" in message for message in progress))

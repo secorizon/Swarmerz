@@ -8,10 +8,12 @@ import copy
 import hashlib
 import json
 import os
+import re
+import secrets
 import shutil
 import stat
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .models import ConfigError
 from .schema_validation import require_schema
@@ -36,6 +38,17 @@ def answer_labels(count: int) -> tuple[str, ...]:
     if not 1 <= count <= 26:
         raise ConfigError(f"answer count must be between 1 and 26; got {count}")
     return tuple(chr(ord("A") + index) for index in range(count))
+
+
+def randomized_answer_order(
+    answers: list[dict[str, Any]],
+    *,
+    shuffle: Callable[[list[dict[str, Any]]], None] | None = None,
+) -> list[dict[str, Any]]:
+    """Return a fresh per-adjudication permutation for blind answer labels."""
+    ordered = list(answers)
+    (shuffle or secrets.SystemRandom().shuffle)(ordered)
+    return ordered
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -222,6 +235,126 @@ def preserve_workspace_artifacts(workspace: Path, artifact_dir: Path) -> dict[st
     return result
 
 
+_LOCATION_SUFFIX = re.compile(r"^(?P<path>.+?):(?P<line>[1-9][0-9]*)(?::[1-9][0-9]*)?$")
+
+
+def verified_reproduction_references(
+    record: dict[str, Any], workspace: Path,
+) -> dict[str, dict[str, Any]] | None:
+    """Resolve structured finding references to regular files inside blind inputs."""
+    reproduction = record.get("reproduction")
+    if not isinstance(reproduction, dict):
+        return None
+    commands = reproduction.get("commands")
+    references = reproduction.get("artifact_refs")
+    method = record.get("validation_method")
+    if (
+        method not in {"executed_reproduction", "source_inspection", "reasoning_only"}
+        or not isinstance(commands, list)
+        or not all(isinstance(item, str) and item.strip() for item in commands)
+        or not isinstance(references, list)
+        or not all(isinstance(item, str) and item.strip() for item in references)
+    ):
+        return None
+    if method == "source_inspection" and not references:
+        return None
+    if method == "executed_reproduction" and (not commands or not references):
+        return None
+
+    root = workspace.resolve()
+    resolved_references: dict[str, dict[str, Any]] = {}
+    for reference in references:
+        reference_path = reference
+        direct = workspace / reference_path
+        if not direct.is_file():
+            match = _LOCATION_SUFFIX.fullmatch(reference)
+            if match is not None:
+                reference_path = match.group("path")
+        relative = Path(reference_path)
+        if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+            return None
+        kind: str
+        if relative.parts[0] == "context":
+            kind = "context"
+            allowed_root = workspace / "context"
+        elif (
+            len(relative.parts) >= 3
+            and relative.parts[0] == ".swarm"
+            and relative.parts[1] in {"artifacts", "evidence"}
+        ):
+            kind = "artifact"
+            allowed_root = workspace / ".swarm" / relative.parts[1]
+        else:
+            return None
+        candidate = workspace
+        for part in relative.parts:
+            candidate /= part
+            if candidate.is_symlink():
+                return None
+        try:
+            resolved = candidate.resolve(strict=True)
+            allowed = allowed_root.resolve(strict=True)
+        except OSError:
+            return None
+        if (
+            not resolved.is_relative_to(root)
+            or not resolved.is_relative_to(allowed)
+            or not resolved.is_file()
+        ):
+            return None
+        resolved_references[reference] = {
+            "workspace_path": resolved.relative_to(root).as_posix(),
+            "kind": kind,
+            "sha256": sha256_file(resolved),
+            "size_bytes": resolved.stat().st_size,
+        }
+    if method == "executed_reproduction" and not any(
+        item["kind"] == "artifact" for item in resolved_references.values()
+    ):
+        return None
+    return resolved_references
+
+
+def preserve_reproduction_references(
+    workspace: Path,
+    records: list[dict[str, Any]],
+    artifact_dir: Path,
+) -> dict[str, Any]:
+    """Seal every file reference used to justify a baseline or final finding."""
+    root = workspace.resolve()
+    findings: list[dict[str, Any]] = []
+    for index, record in enumerate(records):
+        verified = verified_reproduction_references(record, workspace)
+        if verified is None:
+            raise OSError(f"finding {index} has unverifiable reproduction references")
+        references: list[dict[str, Any]] = []
+        for reference, metadata in verified.items():
+            source = root / str(metadata["workspace_path"])
+            preserved = _preserve_evidence_file(root, source, artifact_dir)
+            references.append(
+                {
+                    "reference": reference,
+                    "kind": metadata["kind"],
+                    "sha256": metadata["sha256"],
+                    "size_bytes": metadata["size_bytes"],
+                    "stored": preserved["stored"],
+                }
+            )
+        findings.append(
+            {
+                "finding_index": index,
+                "title": str(record.get("title", "")),
+                "validation_method": record.get("validation_method"),
+                "references": references,
+            }
+        )
+    seal = {"algorithm": "sha256", "findings": findings}
+    destination = artifact_dir / "reproduction-seal.json"
+    write_json(destination, seal)
+    destination.chmod(0o444)
+    return seal
+
+
 def verify_worker_ledger(
     workspace: Path, artifact_dir: Path, *, minimum_workers: int
 ) -> dict[str, Any]:
@@ -322,7 +455,11 @@ def build_blind_bundle(instruction: str, answers: list[dict[str, Any]]) -> dict[
     return {
         "instruction": instruction,
         "answers": [
-            {"answer_id": label, "response": _blind(record["answer"])}
+            {
+                "answer_id": label,
+                "response": _blind(record["answer"]),
+                "evidence_root": f".swarm/evidence/{label}",
+            }
             for label, record in zip(labels, answers, strict=True)
         ],
     }

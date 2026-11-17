@@ -11,11 +11,16 @@ from types import SimpleNamespace
 
 import pytest
 
-from swarmerz.orchestration.artifacts import read_answer
+from swarmerz.orchestration.artifacts import (
+    randomized_answer_order,
+    read_answer,
+    verified_reproduction_references,
+)
 from swarmerz.orchestration.fanout import build_fanout_manifest, fanout_summary
 from swarmerz.orchestration.models import ConfigError
 from swarmerz.orchestration.schema_validation import schema_error
 from swarmerz.orchestration.session_lock import SessionLock
+from swarmerz.orchestration.session_context import copy_independent_file
 
 
 def _answer() -> dict[str, object]:
@@ -61,6 +66,67 @@ def test_all_machine_artifact_schemas_reject_incomplete_objects() -> None:
         problem = schema_error({}, schema_name)
         assert problem is not None
         assert schema_name in problem
+
+
+def test_context_views_have_independent_inodes_and_content(tmp_path: Path) -> None:
+    source = tmp_path / "snapshot.c"
+    destination = tmp_path / "workspace.c"
+    source.write_text("original\n", encoding="utf-8")
+    source.chmod(0o444)
+
+    copy_independent_file(source, destination)
+
+    assert (source.stat().st_dev, source.stat().st_ino) != (
+        destination.stat().st_dev,
+        destination.stat().st_ino,
+    )
+    destination.chmod(0o644)
+    destination.write_text("planted\n", encoding="utf-8")
+    assert source.read_text(encoding="utf-8") == "original\n"
+
+
+def test_blind_answer_order_accepts_a_fresh_permutation() -> None:
+    answers = [{"hunter_id": name} for name in ("one", "two", "three")]
+    shuffled = randomized_answer_order(answers, shuffle=lambda values: values.reverse())
+    assert [item["hunter_id"] for item in shuffled] == ["three", "two", "one"]
+    assert [item["hunter_id"] for item in answers] == ["one", "two", "three"]
+
+
+def test_reproduction_references_must_resolve_to_captured_files(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    source = workspace / "context" / "source.c"
+    artifact = workspace / ".swarm" / "artifacts" / "trigger.txt"
+    source.parent.mkdir(parents=True)
+    artifact.parent.mkdir(parents=True)
+    source.write_text("int main(void) {}\n", encoding="utf-8")
+    artifact.write_text("triggered\n", encoding="utf-8")
+
+    inspected = {
+        "validation_method": "source_inspection",
+        "reproduction": {
+            "commands": [],
+            "observed_result": "inspected",
+            "artifact_refs": ["context/source.c:1"],
+        },
+    }
+    reproduced = {
+        "validation_method": "executed_reproduction",
+        "reproduction": {
+            "commands": ["run-trigger"],
+            "observed_result": "triggered",
+            "artifact_refs": [".swarm/artifacts/trigger.txt"],
+        },
+    }
+    assert verified_reproduction_references(inspected, workspace) is not None
+    assert verified_reproduction_references(reproduced, workspace) is not None
+
+    reproduced["reproduction"]["artifact_refs"] = []
+    assert verified_reproduction_references(reproduced, workspace) is None
+    reproduced["reproduction"]["artifact_refs"] = ["claim without a file"]
+    assert verified_reproduction_references(reproduced, workspace) is None
+    reproduced["reproduction"]["artifact_refs"] = [".swarm/artifacts/trigger.txt"]
+    reproduced["reproduction"]["commands"] = [""]
+    assert verified_reproduction_references(reproduced, workspace) is None
 
 
 def test_session_lock_recovers_stale_marker_but_blocks_live_owner(tmp_path: Path) -> None:

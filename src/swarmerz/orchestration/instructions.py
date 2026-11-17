@@ -100,7 +100,7 @@ def build_baseline_instruction(
     instruction: str, *, has_context: bool, has_history: bool
 ) -> str:
     context_note = (
-        "The frozen, read-only session context is available at context/. Inspect source and artifacts when useful."
+        "An inode-independent view of the frozen session context is available at context/. Inspect source and artifacts when useful."
         if has_context
         else "There is no local-folder context for this session."
     )
@@ -123,7 +123,7 @@ Investigate the instruction directly using only this workspace. Do not browse, u
 - prior_artifact_corroboration: substantially present in an existing report, issue list, audit note, or similar write-up in the supplied context/history;
 - derived: a materially new consequence or chain derived from supplied evidence.
 
-Record the strongest validation method actually performed: executed_reproduction, source_inspection, or reasoning_only. Never describe reasoning-only review as reproduction. For executed reproduction, record the exact commands, observed result, and artifact paths. For source inspection, record precise artifact references. Return only the schema-conforming baseline.
+Record the strongest validation method actually performed: executed_reproduction, source_inspection, or reasoning_only. Never describe reasoning-only review as reproduction. Source-inspection references must name existing files under context/, with optional :line or :line:column suffixes. For executed reproduction, record nonempty exact commands and preserve at least one regular output, trigger, or transcript under .swarm/artifacts/; cite that exact path. Use an empty artifact_refs array for reasoning-only claims without file evidence. Swarmerz resolves and hashes every reference before accepting the result. Return only the schema-conforming baseline.
 
 A pre-existing report or issue list is an exhibit and a lead, not independent proof of its own claims. Corroborate it against underlying source, tests, or captured runtime evidence when available; otherwise state that limitation explicitly.
 """
@@ -133,7 +133,7 @@ def build_analyzer_instruction(
     *, answer_count: int, has_context: bool, has_history: bool, has_baseline: bool = False
 ) -> str:
     context_note = (
-        "The same frozen local-folder context is available at context/; inspect it when useful."
+        "An inode-independent view of the same frozen local-folder context is available at context/; inspect it when useful."
         if has_context
         else "There is no local-folder context for this session."
     )
@@ -155,14 +155,14 @@ def build_analyzer_instruction(
 
 {baseline_note}
 
-.swarm/answers.json contains the current user instruction and exactly {answer_count} sealed responses labeled {labels}. The labels are intentionally blind: do not infer or reward model identity. After the baseline step, read every answer before judging any one answer against another.
+.swarm/answers.json contains the current user instruction and exactly {answer_count} sealed responses labeled {labels}. The labels are intentionally blind and freshly shuffled for this adjudication: do not infer or reward model identity. After the baseline step, read every answer before judging any one answer against another. Each answer declares an evidence_root. .swarm/evidence-index.json lists the regular captured hunter artifacts staged below those blind roots; no hunter identity is present.
 
 {context_note}
 {history_note}
 
 Compare factual correctness, reasoning quality, completeness, relevance, uncertainty handling, and evidence. Identify agreements and material disagreements. Flag unsafe, unsupported, or invented claims. Then produce one best standalone answer to the current user instruction; synthesize when warranted, but do not use majority vote as a substitute for correctness.
 
-Use only the sealed responses, the frozen context/, .swarm/history.json, and the optional .swarm/baseline.json as evidence. Do not browse the web, make network requests, query live services or chains, install dependencies, or access paths outside this analyzer workspace. If the supplied artifacts do not support a claim, mark it unsupported instead of seeking new external evidence.
+Use only the sealed responses, context/, .swarm/evidence/, .swarm/evidence-index.json, .swarm/history.json, and the optional .swarm/baseline.json as evidence. Do not browse the web, make network requests, query live services or chains, install dependencies, or access paths outside this opaque analyzer workspace. If the supplied artifacts do not support a claim, mark it unsupported instead of seeking new external evidence.
 
 {_DEFAULT_WORKLOAD_RULE}
 
@@ -172,7 +172,7 @@ For each validated finding, classify provenance as independent_discovery, prior_
 
 Treat a pre-existing report or issue list as an exhibit and a lead, not independent proof. Hunter repetition of that write-up is still correlated corroboration. Validate against underlying source, tests, or captured runtime evidence when available, and do not upgrade a copied assertion merely because several answers repeat it.
 
-Record the strongest validation method actually performed: executed_reproduction, source_inspection, or reasoning_only. Reproduce executable claims when safe and practical. The reproduction object must contain exact commands, the observed result, and artifact references; use an empty command list for non-executed review and say why in observed_result. Do not equate model consensus with validation.
+Record the strongest validation method actually performed: executed_reproduction, source_inspection, or reasoning_only. Reproduce executable claims when safe and practical. Source-inspection references must resolve to existing context/ files, with optional :line or :line:column suffixes. For executed_reproduction, provide nonempty exact commands and cite at least one existing regular artifact: either captured blind hunter evidence under .swarm/evidence/ or evidence you create under .swarm/artifacts/. Use empty commands and artifact_refs for reasoning-only review without file evidence, and say why in observed_result. Swarmerz resolves, preserves, and hashes every cited file before accepting the analysis. Do not equate model consensus with validation.
 
 Return only the schema-conforming analysis. Do not modify the supplied context or any hunter artifact.
 """
@@ -180,13 +180,13 @@ Return only the schema-conforming analysis. Do not modify the supplied context o
 
 def build_verifier_instruction(*, finding_count: int, has_context: bool) -> str:
     context_note = (
-        "The same frozen, read-only context is available at context/."
+        "An inode-independent view of the same frozen context is available at context/."
         if has_context
         else "There is no local-folder context."
     )
     return f"""Act as a fresh secondary adjudicator. Verify, do not merely endorse, the primary adjudicator's {finding_count} validated finding(s).
 
-Read .swarm/answers.json and .swarm/primary-analysis.json. Hunter identities remain blind. {context_note}
+Read .swarm/answers.json, .swarm/primary-analysis.json, and .swarm/evidence-index.json. Captured hunter artifacts are staged under each answer's blind evidence_root. Hunter identities remain blind. {context_note}
 
 For every primary validated finding, emit exactly one finding_assessments entry using its zero-based array index. Use confirmed only when the frozen evidence supports the claim. Use rejected for a false, duplicated, or contradicted claim, and uncertain when the available evidence cannot decide it. Independently inspect source and run safe, read-only reproductions when practical. {_DEFAULT_WORKLOAD_RULE} Record the strongest method actually used: executed_reproduction, source_inspection, or reasoning_only. Do not use answer count or agreement as proof.
 

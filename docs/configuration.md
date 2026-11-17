@@ -118,7 +118,7 @@ set.
 
 | Setting | Default | Meaning |
 |---|---:|---|
-| `isolation.mode` | `workspace` | The only implemented mode. |
+| `isolation.mode` | `workspace` | Independent context views and opaque adjudication staging; still a same-user application boundary. |
 | `isolation.inherit_environment` | `false` | Prevents unrestricted host-environment inheritance. |
 | `isolation.opencode_server_mode` | `shared` | `shared` uses one private round service; `per_hunter` gives native OpenCode parents separate passwords and state roots. |
 
@@ -172,7 +172,8 @@ The `[storage]` table controls disposable build and dependency caches, not durab
 
 The cache root and `output_root` cannot contain one another. The cache root cannot be `/`, the home
 directory, an unmarked non-empty directory, or a symlink. Cache maintenance never deletes
-`swarm-runs`.
+`swarm-runs`. Randomly named adjudication staging under the managed `opaque/` subtree follows the
+same successful cleanup and failed-scratch retention policy.
 
 ## Credentials
 

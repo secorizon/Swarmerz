@@ -39,6 +39,7 @@ async def execute_round_protocol(
                 raise ConfigError(
                     "baseline-first adjudication failed; hunters were not launched"
                 )
+            runner._verify_context_snapshot("after-baseline")
 
         runner._update_manifest(status="hunting")
         native_opencode = any(
@@ -83,6 +84,10 @@ async def execute_round_protocol(
             partial_hunters=partial_hunters,
         )
 
+        # No adjudicator sees hunter output unless the canonical evidence still
+        # matches the digest recorded when the session was frozen.
+        runner._verify_context_snapshot("before-adjudication")
+
         analysis: dict[str, Any] | None = None
         analyzer_result: dict[str, Any] | None = None
         verification: dict[str, Any] | None = None
@@ -111,6 +116,7 @@ async def execute_round_protocol(
             and (runner.config.secondary_analyzer is None or verification is not None)
             else None
         )
+        runner._verify_context_snapshot("after-adjudication")
         if accepted_analysis is not None:
             write_json(
                 runner.run_dir / "analysis" / "accepted-analysis.json",
@@ -148,8 +154,6 @@ async def execute_round_protocol(
                 if result.get("answer_sealed")
             ],
         )
-        runner._save_review_context(final_analysis)
-
         complete = (
             quorum_reached
             and analysis is not None

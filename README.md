@@ -117,7 +117,7 @@ inventory and tool capability are probed for native Ollama routes.
 | macOS | Supported | Install Python and every configured harness for the same architecture. Terminal copy uses `pbcopy` when available. Package installation, the console command, doctor, and the test suite are exercised by project CI. |
 | Windows | WSL2 | Run the Linux workflow inside WSL2 and keep the checkout, frozen context, run artifacts, and cache on the WSL Linux filesystem. Native Windows is not supported. |
 
-Swarmerz depends on POSIX process signaling, terminal behavior, file permissions, and hardlinks, so
+Swarmerz depends on POSIX process signaling, terminal behavior, and file permissions, so
 native Windows is not merely an untested packaging target. Models need not run on the same machine:
 an Ollama or internal inference endpoint may live elsewhere on the LAN as long as the configured
 runtime can reach it.
@@ -139,9 +139,9 @@ adjudicator writes its own assessment before any hunter answer is disclosed. Swa
 every configured parent and its private worker swarm, seals contract-valid answers, and gives blind
 copies to a fresh primary adjudication process after the configured answer quorum is reached. When
 `[secondary_analyzer]` is configured, a different model or provider verifies every primary finding;
-only findings it confirms cross into later rounds. Solid arrows show mission and evidence flow. Dotted arrows show live
-control and telemetry; steering reaches active parents and unfinished workers without sharing one
-hunter's evidence with another.
+only findings it confirms cross into later rounds. Solid arrows show mission and evidence flow.
+Dotted arrows show live control and telemetry; steering reaches active parents and unfinished
+workers without Swarmerz injecting one hunter's evidence into another hunter's prompt.
 
 The reviewer/judge completes Swarmerz's software task by reviewing the sealed reports and emitting
 the final report plus its durable audit record. The security team's human review happens afterward,
@@ -158,14 +158,16 @@ A later round in the same session is not a repeat of round one. Every hunter rec
   by the secondary verifier when one is configured—in prior completed rounds.
 
 The new instruction remains authoritative. Hunters are told to build on the validated baseline and
-investigate implications, exploit chains, and surfaces that earlier rounds missed. Raw answers from
-other hunters never cross the isolation boundary. The adjudicator receives the current blind
-answers plus accepted prior adjudications.
+investigate implications, exploit chains, and surfaces that earlier rounds missed. Swarmerz never
+passes another hunter's raw answer into a hunter prompt or history. Workspaces remain a same-user
+application boundary rather than hostile-process confinement. The adjudicator receives the current
+blind answers plus accepted prior adjudications.
 
 Only completed rounds contribute shared findings. Failed or incomplete rounds, rejected claims,
 unverified partial notes, and findings without a sealed supporting answer are not injected into the
-next round. The frozen source snapshot remains unchanged for the entire session; start a new session
-when the target needs a fresh snapshot.
+next round. Every role receives an inode-independent copy-on-write or copied context view. Swarmerz
+re-hashes the canonical snapshot before and after adjudication and fails the round on any mismatch;
+start a new session when the target needs a fresh snapshot.
 
 ### Blind finding protocol
 
@@ -175,9 +177,11 @@ when the target needs a fresh snapshot.
 specific model vendors or deployment locations.
 
 During blind adjudication, Swarmerz strips AI, model, provider, harness, session, and other
-provenance fields and labels submissions as `Answer A`, `Answer B`, and so on. Original identities
-and answer hashes remain sealed separately for auditability; attribution is restored only after
-adjudication in the final artifacts. The baseline passed to the next round contains the finding,
+provenance fields, freshly shuffles the sealed submissions, and labels them as `Answer A`, `Answer
+B`, and so on. The judge runs from opaque scratch staging that contains only independent context,
+blind inputs, and captured evidence. Original identities and answer hashes remain sealed separately
+for auditability; the private label map is written only after adjudication exits, and attribution is
+then restored in final artifacts. The baseline passed to the next round contains the finding,
 severity, validation, evidence, provenance class, validation method, and number of supporting
 hunters—not their names.
 
@@ -185,10 +189,12 @@ Every validated finding is classified as `independent_discovery`,
 `prior_artifact_corroboration`, or `derived`. A vulnerability already described in an audit note or
 issue list inside the frozen context is corroboration, even when every hunter agrees. Validation is
 also explicit: `executed_reproduction`, `source_inspection`, or `reasoning_only`, with commands,
-observed results, and artifact references recorded in the structured finding. Consensus alone is
-not validation. Pre-existing write-ups are exhibits and leads, not independent proof; the
-adjudicator is instructed to check their claims against underlying source, tests, or captured
-runtime evidence rather than upgrading copied assertions by repetition.
+observed results, and artifact references recorded in the structured finding. Source references
+must resolve inside the independent context view; executed reproductions also require at least one
+regular captured artifact. Accepted references are preserved and hashed in a reproduction seal.
+Consensus alone is not validation. Pre-existing write-ups are exhibits and leads, not independent
+proof; the adjudicator is instructed to check their claims against underlying source, tests, or
+captured runtime evidence rather than upgrading copied assertions by repetition.
 
 Blinding is a fixed-field label strip, not an anonymity proof: prose, URLs, or writing style can
 still reveal a model family. Reports therefore disclose provider/model/harness overlap between
@@ -248,11 +254,13 @@ a multi-hour audit.
 
 | Mode | Context behavior | Intended use |
 |---|---|---|
-| `codebase` | Freezes a local directory once and hardlinks a read-only view into each workspace | Source audits, vulnerability research, protocol reviews |
+| `codebase` | Freezes a local directory once and gives each role an inode-independent reflink or copied view | Source audits, vulnerability research, protocol reviews |
 | `raw` | Freezes no local files | Web assessments, research, threat modeling, reasoning |
 
-Raw instructions that reference an existing local path are rejected before launch because hunters
-cannot read host paths outside their workspaces. Choose `codebase` when local evidence is required.
+Raw instructions that reference an existing local path are rejected before launch because those
+paths are not staged into hunter workspaces or supplied by the protocol. This is an application
+boundary, not a claim that a hostile same-user process cannot search the host. Choose `codebase`
+when local evidence is required.
 URLs do not require local context.
 
 Session names must start with a letter or digit and may contain letters, digits, dots, underscores,
@@ -392,8 +400,9 @@ data residency, latency, tool reliability, context length, hardware, and cost:
 - **Local-only hunters:** OpenCode routes each parent to Ollama on the workstation or a LAN
   inference server. Source and prompts stay within that deployment boundary when no configured
   adapter, provider, or tool sends them elsewhere.
-- **Mixed fleet:** local models provide broad, inexpensive coverage while selected hosted models
-  contribute different training and reasoning substrates.
+- **Mixed fleet:** local models can add broad, inexpensive search capacity while selected hosted
+  models contribute different training and reasoning substrates. Coverage improvement is a goal,
+  not a bundled benchmark result.
 - **Custom runtimes:** a `command` harness can call an internal gateway, another agent framework,
   or an air-gapped inference service while preserving Swarmerz's artifact contract.
 - **Local adjudication:** the primary or secondary analyzer may use a command adapter that writes
@@ -461,6 +470,8 @@ manage its configured child workstreams; locality does not bypass the evidence o
   Go build/module data, npm downloads, NuGet packages, pip/uv downloads, and ccache objects.
 - `~/.cache/swarmerz/scratch/...` contains per-round `TMPDIR`, Cargo targets, .NET CLI state, clones,
   builds, and other disposable worker files.
+- `~/.cache/swarmerz/opaque/...` contains randomly named adjudication workspaces and stage-local
+  temporary state, separate from identified hunter runtime trees.
 
 Swarmerz removes successful-run scratch and workspaces only after durable evidence is sealed.
 Incomplete and failed workspaces remain in the round for recovery; their separate scratch data is
@@ -647,12 +658,16 @@ swarm-runs/sessions/<session>/
     │   ├── partial-notes.md               # unverified; only when recoverable
     │   └── stdout.jsonl / stderr.log
     ├── baseline/
-    │   └── baseline.json                  # written before hunter-answer disclosure when enabled
+    │   ├── baseline.json                  # written before hunter-answer disclosure when enabled
+    │   └── reproduction-seal.json         # resolved and hashed baseline evidence references
     ├── analysis/
     │   ├── analysis.json                  # raw blind primary adjudication
     │   ├── accepted-analysis.json         # carry-forward set after optional secondary gate
     │   ├── blind-answers.json             # exact adjudicator input bundle
-    │   ├── answer-map.json                # blind label to sealed hunter mapping
+    │   ├── blind-evidence-index.json       # identity-free captured-artifact inventory
+    │   ├── reproduction-seal.json         # resolved references, hashes, and durable locations
+    │   ├── evidence/                      # preserved artifacts cited by primary analysis
+    │   ├── answer-map.json                # private label map, written after judge exit
     │   └── stdout.jsonl / stderr.log
     ├── secondary-analysis/
     │   └── verification.json              # optional per-finding confirmation
@@ -667,13 +682,16 @@ The manifest is authoritative. A round can complete with degraded coverage when 
 succeed but one or more hunters are missing or an internal worker swarm is partial. Drafts and
 `partial-notes.md` are never represented as sealed or validated answers.
 Successful rounds remove reproducible workspace trees after evidence collection. Starting a review
-chat reconstructs a small analyzer workspace from durable artifacts and hardlinks the frozen context
-without duplicating its file data.
+chat reconstructs a small analyzer workspace from durable artifacts and creates an independent
+copy-on-write or copied context view.
 
 ## Safety and trust boundaries
 
 - Workspace isolation is an application boundary, not an operating-system sandbox against a
   malicious process with unrestricted host access. Use a hardened VM or container for hostile code.
+- Opaque adjudication staging prevents the normal judge input from exposing identified sibling
+  directories. It does not stop a deliberately hostile same-user process from searching other host
+  paths; use a separate OS identity, VM, or container when that is in scope.
 - Linux user-systemd resource scopes limit accidental memory and task explosions when available,
   but they do not restrict filesystem, network, or same-user process access. Automatic fallback is
   recorded in the round manifest.
@@ -691,6 +709,9 @@ without duplicating its file data.
   launch; hidden files, repository metadata, credentials, and build artifacts are not inherently
   safe to disclose merely because they are in the target directory.
 - Symlinks are skipped by default. Enable them only when preserving their targets is intentional.
+- The repository does not ship a vulnerability-detection benchmark or claim a measured recall
+  improvement from adding models. Model diversity is intended to broaden search coverage; detection
+  lift must be established against a representative ground-truth corpus for each deployment.
 - Unattended OpenCode permission requests are rejected rather than granted. Repeated unresolved
   requests surface as `BLOCKED` and prevent that hunter from sealing an answer.
 - Complete raw model and tool logs remain in the round artifacts even when the signal rail filters

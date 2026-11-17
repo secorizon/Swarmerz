@@ -21,6 +21,7 @@ from .protocol_support import (
     utc_now as _utc_now,
 )
 from .session_context import (
+    copy_independent_file as _copy_independent_file,
     context_copy_ignore as _context_copy_ignore,
     context_digest as _context_digest,
     validate_context_tree as _validate_context_tree,
@@ -38,7 +39,7 @@ class SessionLifecycleMixin:
         self._session_lock.release()
 
     def _freeze_context_snapshot(self) -> None:
-        """Keep hardlinked workspace views from modifying the shared snapshot."""
+        """Make the canonical snapshot visibly non-writable between checks."""
         for directory, names, files in os.walk(self.context_snapshot, followlinks=False):
             for name in files:
                 path = Path(directory) / name
@@ -50,33 +51,71 @@ class SessionLifecycleMixin:
                     path.chmod(path.stat().st_mode & ~0o222)
         self.context_snapshot.chmod(self.context_snapshot.stat().st_mode & ~0o222)
 
-    def _link_context(self, workspace: Path, *, label: str | None = None) -> None:
+    def _stage_context(self, workspace: Path, *, label: str | None = None) -> None:
         if not self.context_snapshot.is_dir():
             return
-        linked_files = 0
+        copied_files = 0
 
-        def link_file(source: str, destination: str) -> str:
-            nonlocal linked_files
+        def copy_file(source: str, destination: str) -> str:
+            nonlocal copied_files
             try:
-                os.link(source, destination)
+                result = _copy_independent_file(source, destination)
             except OSError as exc:
                 raise ConfigError(
-                    f"cannot link session context into {workspace}: {exc}; "
-                    "the snapshot and workspace must support hardlinks on the same filesystem"
+                    f"cannot create an independent context view in {workspace}: {exc}"
                 ) from exc
-            linked_files += 1
-            return destination
+            copied_files += 1
+            return result
 
         shutil.copytree(
             self.context_snapshot,
             workspace / "context",
             symlinks=True,
-            copy_function=link_file,
+            copy_function=copy_file,
         )
         self._emit(
-            f"[setup] [{label or workspace.name}] context linked to session snapshot "
-            f"({linked_files} files; no duplicate file data)"
+            f"[setup] [{label or workspace.name}] independent context staged "
+            f"({copied_files} files; copy-on-write when supported)"
         )
+
+    def _verify_context_snapshot(self, phase: str) -> str | None:
+        """Re-hash the canonical snapshot and fail closed on any content change."""
+        expected = self.session.get("context_sha256") if self.session else None
+        if expected is None:
+            if self.context_snapshot.exists():
+                raise ConfigError(
+                    "frozen context exists without a recorded integrity digest"
+                )
+            return None
+        if not isinstance(expected, str) or not expected:
+            raise ConfigError("session context_sha256 is missing or invalid")
+        if not self.context_snapshot.is_dir():
+            raise ConfigError("recorded frozen context snapshot is missing")
+        self._emit(f"[integrity] verifying frozen context: {phase}")
+        actual = _context_digest(self.context_snapshot)
+        passed = actual == expected
+        if self.manifest:
+            context_record = dict(self.manifest.get("context") or {})
+            checks = list(context_record.get("integrity_checks") or [])
+            checks.append(
+                {
+                    "phase": phase,
+                    "expected_sha256": expected,
+                    "actual_sha256": actual,
+                    "passed": passed,
+                    "checked_at": _utc_now(),
+                }
+            )
+            context_record["integrity_checks"] = checks
+            self._update_manifest(context=context_record)
+        if not passed:
+            raise ConfigError(
+                "frozen context integrity mismatch during "
+                f"{phase}: expected {expected}, found {actual}"
+            )
+        self._freeze_context_snapshot()
+        self._emit(f"[integrity] frozen context verified: {phase}")
+        return actual
 
     def _copytree_with_progress(
         self, source: Path, destination: Path, *, label: str,
@@ -125,7 +164,7 @@ class SessionLifecycleMixin:
                 raise ConfigError("session context snapshot is missing or inconsistent")
             self.session = session
             if frozen_source is not None:
-                self._freeze_context_snapshot()
+                self._verify_context_snapshot("session-open")
                 self._emit(f"[setup] reusing frozen session context: {self.context_snapshot}")
         else:
             skipped_context_symlinks: tuple[str, ...] = ()
@@ -251,6 +290,8 @@ class SessionLifecycleMixin:
                 "present": self.context_snapshot.is_dir(),
                 "sha256": self.session.get("context_sha256"),
                 "frozen_for_session": True,
+                "workspace_copy_strategy": "reflink-or-copy",
+                "integrity_checks": [],
             },
             "instruction_sha256": hashlib.sha256(self.instruction.encode()).hexdigest(),
             "required_answer_count": self.config.minimum_answers,
@@ -273,8 +314,12 @@ class SessionLifecycleMixin:
                 "top_level_hunters_share_messages": False,
                 "each_hunter_receives_only_its_own_prior_answers": True,
                 "all_hunters_receive_prior_validated_findings": True,
-                "hunter_outputs_visible_only_after_all_finish": True,
+                "orchestrator_discloses_hunter_outputs_only_after_all_finish": True,
+                "same_user_hostile_process_isolation": False,
+                "workspace_context_inodes_shared": False,
                 "adjudicator_receives_blind_current_answers": True,
+                "adjudicator_uses_opaque_scratch_staging": True,
+                "blind_answer_order_randomized": True,
                 "fresh_primary_process_per_round": True,
                 "baseline_first": self.config.analyzer.baseline_first,
                 "secondary_confirmation": self.config.secondary_analyzer is not None,
@@ -346,6 +391,10 @@ class SessionLifecycleMixin:
                 self.run_dir / "secondary-analysis",
                 "secondary-analysis",
             ),
+            *(
+                (workspace, artifact_dir, f"blind-{phase}")
+                for workspace, artifact_dir, phase in self._adjudication_workspaces
+            ),
         ]
         try:
             for workspace, artifact_dir, label in workspace_artifact_pairs:
@@ -393,9 +442,9 @@ class SessionLifecycleMixin:
 
         try:
             if workspaces.exists():
-                # Context files are hardlinks to the immutable session snapshot.
-                # Only directory inodes are made writable; chmod on a linked file
-                # would also mutate the durable snapshot's mode.
+                # Workspace context files have independent inodes. Directory
+                # permissions are relaxed only so the disposable tree can be
+                # removed after its durable evidence has been staged.
                 for directory, names, _files in os.walk(workspaces, followlinks=False):
                     directory_path = Path(directory)
                     directory_path.chmod(directory_path.stat().st_mode | stat.S_IRWXU)

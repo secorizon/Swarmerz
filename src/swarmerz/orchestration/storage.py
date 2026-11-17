@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -208,6 +209,7 @@ class StorageManager:
         self.run_id: str | None = None
         self.run_root: Path | None = None
         self.active_path: Path | None = None
+        self.opaque_roots: list[Path] = []
 
     def _validate_root(self) -> None:
         resolved = self.root.resolve(strict=False)
@@ -290,22 +292,28 @@ class StorageManager:
         return now - completed_at >= self.config.maintenance_interval_hours * 3600
 
     def _scratch_runs(self) -> list[tuple[Path, dict[str, Any]]]:
-        scratch = self.root / "scratch"
-        if not scratch.is_dir():
-            return []
         records: list[tuple[Path, dict[str, Any]]] = []
-        for marker in scratch.rglob(".run.json"):
-            try:
-                value = json.loads(marker.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                value = {}
-            records.append((marker.parent, value))
+        for name in ("scratch", "opaque"):
+            scratch = self.root / name
+            if not scratch.is_dir():
+                continue
+            for marker in scratch.rglob(".run.json"):
+                try:
+                    value = json.loads(marker.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    value = {}
+                records.append((marker.parent, value))
         return records
+
+    def _managed_bytes(self) -> int:
+        return sum(
+            _tree_size(self.root / name) for name in ("shared", "scratch", "opaque")
+        )
 
     def _prune_locked(self, *, now: float) -> dict[str, Any]:
         if self._live_active(remove_stale=True):
             raise ConfigError("cannot prune the Swarmerz cache while a run is active")
-        before = _tree_size(self.root / "shared") + _tree_size(self.root / "scratch")
+        before = self._managed_bytes()
         deleted_bytes = 0
         deleted_files = 0
         deleted_scratch_runs = 0
@@ -352,7 +360,7 @@ class StorageManager:
                             pass
             _remove_empty_directories(shared)
 
-        current = _tree_size(shared) + _tree_size(self.root / "scratch")
+        current = self._managed_bytes()
         target = int(self.config.max_cache_bytes * 0.9)
         if current > self.config.max_cache_bytes:
             scratch_records = sorted(
@@ -380,8 +388,9 @@ class StorageManager:
                     deleted_files += 1
                 _remove_empty_directories(shared)
 
-        after = _tree_size(shared) + _tree_size(self.root / "scratch")
+        after = self._managed_bytes()
         _remove_empty_directories(self.root / "scratch")
+        _remove_empty_directories(self.root / "opaque")
         report = {
             "before_bytes": before,
             "after_bytes": after,
@@ -419,7 +428,32 @@ class StorageManager:
             self.run_id = run_id
             self.run_root = run_root
             self.active_path = active_path
+            self.opaque_roots = []
             return report
+
+    def allocate_opaque_scratch(self, purpose: str) -> Path:
+        """Allocate managed scratch whose path contains no session or role identity."""
+        if self.run_id is None or self.run_root is None or self.active_path is None:
+            raise ConfigError("opaque scratch requires an active storage run")
+        label = purpose if _SAFE_PART.fullmatch(purpose) else "adjudication"
+        now = time.time()
+        with self._lock():
+            parent = self.root / "opaque"
+            parent.mkdir(exist_ok=True, mode=0o700)
+            parent.chmod(0o700)
+            allocated = Path(tempfile.mkdtemp(prefix=f"{label}-", dir=parent))
+            allocated.chmod(0o700)
+            _atomic_json(
+                allocated / ".run.json",
+                {
+                    "run_id": "opaque-adjudication",
+                    "status": "active",
+                    "pid": os.getpid(),
+                    "last_activity_epoch": now,
+                },
+            )
+            self.opaque_roots.append(allocated)
+        return allocated
 
     def deactivate(self, *, successful: bool) -> None:
         if self.run_id is None or self.run_root is None or self.active_path is None:
@@ -427,34 +461,50 @@ class StorageManager:
         now = time.time()
         with self._lock():
             if successful:
+                for opaque_root in self.opaque_roots:
+                    _remove_tree(opaque_root, self.root)
                 _remove_tree(self.run_root, self.root)
                 _remove_empty_directories(self.root / "scratch")
-            elif self.run_root.is_dir():
-                _atomic_json(self.run_root / ".run.json", {
-                    "run_id": self.run_id,
-                    "status": "retained_after_failure",
-                    "pid": os.getpid(),
-                    "last_activity_epoch": now,
-                })
+                _remove_empty_directories(self.root / "opaque")
+            else:
+                if self.run_root.is_dir():
+                    _atomic_json(self.run_root / ".run.json", {
+                        "run_id": self.run_id,
+                        "status": "retained_after_failure",
+                        "pid": os.getpid(),
+                        "last_activity_epoch": now,
+                    })
+                for retained_root in self.opaque_roots:
+                    if retained_root.is_dir():
+                        _atomic_json(retained_root / ".run.json", {
+                            "run_id": "opaque-adjudication",
+                            "status": "retained_after_failure",
+                            "pid": os.getpid(),
+                            "last_activity_epoch": now,
+                        })
             self.active_path.unlink(missing_ok=True)
         self.run_id = None
         self.run_root = None
         self.active_path = None
+        self.opaque_roots = []
 
     def status(self) -> dict[str, Any]:
         if not self._require_existing_root():
             return {
                 "root": str(self.root), "exists": False, "shared_bytes": 0,
-                "scratch_bytes": 0, "total_bytes": 0, "active_runs": [],
+                "scratch_bytes": 0, "opaque_scratch_bytes": 0,
+                "total_bytes": 0, "active_runs": [],
             }
+        shared_bytes = _tree_size(self.root / "shared")
+        normal_scratch_bytes = _tree_size(self.root / "scratch")
+        opaque_scratch_bytes = _tree_size(self.root / "opaque")
         return {
             "root": str(self.root),
             "exists": True,
-            "shared_bytes": _tree_size(self.root / "shared"),
-            "scratch_bytes": _tree_size(self.root / "scratch"),
-            "total_bytes": (
-                _tree_size(self.root / "shared") + _tree_size(self.root / "scratch")
-            ),
+            "shared_bytes": shared_bytes,
+            "scratch_bytes": normal_scratch_bytes + opaque_scratch_bytes,
+            "opaque_scratch_bytes": opaque_scratch_bytes,
+            "total_bytes": shared_bytes + normal_scratch_bytes + opaque_scratch_bytes,
             "active_runs": self._live_active(remove_stale=False),
             "max_cache_bytes": self.config.max_cache_bytes,
         }
@@ -469,8 +519,8 @@ class StorageManager:
         with self._lock():
             if self._live_active(remove_stale=True):
                 raise ConfigError("cannot clear the Swarmerz cache while a run is active")
-            deleted = _tree_size(self.root / "shared") + _tree_size(self.root / "scratch")
-            for name in ("shared", "scratch"):
+            deleted = self._managed_bytes()
+            for name in ("shared", "scratch", "opaque"):
                 _remove_tree(self.root / name, self.root)
             (self.root / _MAINTENANCE_NAME).unlink(missing_ok=True)
             return {"deleted_bytes": deleted, "root": str(self.root)}

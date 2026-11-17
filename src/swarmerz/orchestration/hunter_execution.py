@@ -199,7 +199,7 @@ class HunterExecutionMixin:
         artifact_dir = self.run_dir / "hunters" / engine.id
         workspace.mkdir(parents=True)
         artifact_dir.mkdir(parents=True)
-        self._link_context(workspace, label=self._hunter_progress_name(engine))
+        self._stage_context(workspace, label=self._hunter_progress_name(engine))
         if engine.ollama_base_url is not None:
             write_json(
                 workspace / "opencode.json",

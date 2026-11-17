@@ -57,12 +57,16 @@ class StorageTests(unittest.TestCase):
             shared.write_bytes(b"shared")
             scratch = Path(environment["TMPDIR"]) / "build.o"
             scratch.write_bytes(b"scratch")
+            opaque = manager.allocate_opaque_scratch("primary")
+            (opaque / "judge.tmp").write_text("blind", encoding="utf-8")
+            self.assertNotIn("session", opaque.as_posix())
             self.assertEqual(len(manager.status()["active_runs"]), 1)
 
             manager.deactivate(successful=True)
 
             self.assertTrue(shared.is_file())
             self.assertFalse((config.cache_root / "scratch" / "session" / "round").exists())
+            self.assertFalse(opaque.exists())
             self.assertEqual(manager.status()["active_runs"], [])
 
     def test_prune_removes_expired_failed_scratch_and_read_only_cache_files(self) -> None:
@@ -91,6 +95,21 @@ class StorageTests(unittest.TestCase):
             self.assertGreater(report["deleted_bytes"], 0)
             self.assertFalse(cached.exists())
             self.assertFalse(run_marker.parent.exists())
+
+    def test_failed_opaque_scratch_retains_no_session_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(Path(directory))
+            manager = StorageManager(config)
+            manager.activate("sensitive-session/round")
+            opaque = manager.allocate_opaque_scratch("primary")
+            (opaque / "workspace").mkdir()
+
+            manager.deactivate(successful=False)
+
+            marker = json.loads((opaque / ".run.json").read_text(encoding="utf-8"))
+            self.assertEqual(marker["run_id"], "opaque-adjudication")
+            self.assertEqual(marker["status"], "retained_after_failure")
+            self.assertNotIn("sensitive-session", opaque.as_posix())
 
     def test_size_cap_evicts_oldest_shared_files(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import site
 import subprocess
 import sys
 import sysconfig
@@ -242,7 +243,16 @@ def test_release_artifacts_are_installable_and_contain_only_runtime_material(
         text=True,
     ).stdout.strip()
     (Path(nested_site) / "swarmerz-test-runtime.pth").write_text(
-        sysconfig.get_path("purelib") + "\n",
+        "\n".join(
+            dict.fromkeys(
+                [
+                    sysconfig.get_path("purelib"),
+                    *site.getsitepackages(),
+                    site.getusersitepackages(),
+                ]
+            )
+        )
+        + "\n",
         encoding="utf-8",
     )
     subprocess.run(

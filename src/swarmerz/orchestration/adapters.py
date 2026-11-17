@@ -220,6 +220,7 @@ def build_analyzer_command(
     artifact_dir: Path,
     answers_path: Path,
     prompt: str,
+    schema_path: Path | None = None,
 ) -> CommandSpec:
     return _build_adjudicator_command(
         config,
@@ -231,6 +232,7 @@ def build_analyzer_command(
         prompt=prompt,
         phase="analysis",
         schema_name="analysis.schema.json",
+        schema_path=schema_path,
         result_name="analysis.json",
     )
 
@@ -243,6 +245,7 @@ def build_baseline_command(
     workspace: Path,
     artifact_dir: Path,
     prompt: str,
+    schema_path: Path | None = None,
 ) -> CommandSpec:
     return _build_adjudicator_command(
         config,
@@ -254,6 +257,7 @@ def build_baseline_command(
         prompt=prompt,
         phase="baseline",
         schema_name="baseline.schema.json",
+        schema_path=schema_path,
         result_name="baseline.json",
     )
 
@@ -268,6 +272,7 @@ def build_verifier_command(
     answers_path: Path,
     primary_analysis_path: Path,
     prompt: str,
+    schema_path: Path | None = None,
 ) -> CommandSpec:
     return _build_adjudicator_command(
         config,
@@ -279,6 +284,7 @@ def build_verifier_command(
         prompt=prompt,
         phase="verification",
         schema_name="verification.schema.json",
+        schema_path=schema_path,
         result_name="verification.json",
     )
 
@@ -294,9 +300,10 @@ def _build_adjudicator_command(
     prompt: str,
     phase: str,
     schema_name: str,
+    schema_path: Path | None,
     result_name: str,
 ) -> CommandSpec:
-    schema = Path(__file__).resolve().parent / "schemas" / schema_name
+    schema = schema_path or Path(__file__).resolve().parent / "schemas" / schema_name
     result = artifact_dir / result_name
     if engine.command:
         values = {
@@ -323,7 +330,7 @@ def _build_adjudicator_command(
             "--json",
             "--skip-git-repo-check",
             "--sandbox",
-            "read-only",
+            "workspace-write",
             "-m",
             engine.effective_model,
             "-c",

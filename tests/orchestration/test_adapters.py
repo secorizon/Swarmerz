@@ -156,7 +156,7 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(grok.swarm_size, 4)
         self.assertIn("qwen", argv)
 
-    def test_analyzer_is_confined_to_captured_evidence(self) -> None:
+    def test_analyzer_is_told_to_use_only_staged_captured_evidence(self) -> None:
         instruction = build_analyzer_instruction(
             answer_count=3, has_context=True, has_history=True
         )
@@ -164,6 +164,8 @@ class AdapterTests(unittest.TestCase):
         self.assertIn("Do not", instruction)
         self.assertIn("query live services or chains", instruction)
         self.assertIn("mark it unsupported", instruction)
+        self.assertIn(".swarm/evidence-index.json", instruction)
+        self.assertIn("opaque analyzer workspace", instruction)
 
     def test_hunter_is_told_to_use_shared_validated_findings_as_evidence(self) -> None:
         config = load_config(PROJECT_ROOT / "swarmerz.toml")
@@ -218,6 +220,7 @@ class AdapterTests(unittest.TestCase):
             ["A", "B", "C", "D", "E"],
         )
         self.assertTrue(all("hunter_id" not in item["response"] for item in bundle["answers"]))
+        self.assertEqual(bundle["answers"][0]["evidence_root"], ".swarm/evidence/A")
 
     def test_incomplete_report_can_preserve_one_answer(self) -> None:
         with TemporaryDirectory() as directory:

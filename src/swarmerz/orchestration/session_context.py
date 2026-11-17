@@ -8,14 +8,68 @@ import fnmatch
 import hashlib
 import os
 import re
+import shutil
+import stat
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
 from .artifacts import read_json
 from .models import AppConfig, ConfigError
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - native Windows is unsupported
+    fcntl = None  # type: ignore[assignment]
+
 
 _SESSION_ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,95}$")
+_LINUX_FICLONE = 0x40049409
+
+
+def copy_independent_file(source: str | Path, destination: str | Path) -> str:
+    """Create an inode-independent context file, preferring copy-on-write storage.
+
+    Linux filesystems that implement ``FICLONE`` share physical extents until a
+    writer changes the destination, while keeping permissions and file contents
+    independent. Other filesystems and platforms fall back to a normal copy.
+    """
+    source_path = Path(source)
+    destination_path = Path(destination)
+    cloned = False
+    source_descriptor = -1
+    destination_descriptor = -1
+    try:
+        if fcntl is not None and os.name == "posix" and sys.platform.startswith("linux"):
+            source_descriptor = os.open(
+                source_path,
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+            )
+            destination_descriptor = os.open(
+                destination_path,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0),
+                stat.S_IRUSR | stat.S_IWUSR,
+            )
+            fcntl.ioctl(destination_descriptor, _LINUX_FICLONE, source_descriptor)
+            cloned = True
+    except OSError:
+        if destination_descriptor >= 0:
+            os.close(destination_descriptor)
+            destination_descriptor = -1
+        destination_path.unlink(missing_ok=True)
+    finally:
+        if destination_descriptor >= 0:
+            os.close(destination_descriptor)
+        if source_descriptor >= 0:
+            os.close(source_descriptor)
+    if cloned:
+        shutil.copystat(source_path, destination_path, follow_symlinks=False)
+    else:
+        shutil.copy2(source_path, destination_path, follow_symlinks=False)
+    return str(destination_path)
 
 
 def resolve_context(config: AppConfig, override: str | Path | None) -> Path | None:

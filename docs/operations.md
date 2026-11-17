@@ -11,16 +11,19 @@ reviewer/judge's report; security-team review follows outside the product.
 
 ## Round lifecycle
 
-1. **Freeze evidence.** A codebase context is copied once, hashed, made unwritable, and linked into
-   isolated workspaces. Raw missions without local evidence skip this step.
+1. **Freeze evidence.** A codebase context is copied once, hashed, and made unwritable. Every role
+   receives an inode-independent reflink or copied view. The canonical digest is rechecked at
+   protocol boundaries, and any mismatch fails the round. Raw missions without local evidence skip
+   this step.
 2. **Optional baseline.** When `analyzer.baseline_first = true`, the primary analyzer records a
    pre-hunt assessment before it can see hunter answers. This is disabled by default.
 3. **Independent hunts.** Every configured parent starts independently and manages its requested
-   worker fan-out. Hunters do not receive other hunters' raw answers.
-4. **Seal and quorum.** Contract-valid answers are staged, hashed, made read-only, and copied into a
-   blind answer bundle. Missing or partial coverage remains visible.
-5. **Reviewer/judge.** A fresh analyzer evaluates every sealed report, disagreements, factual risks,
-   provenance, and validation method, then emits the final result.
+   worker fan-out. Swarmerz does not put other hunters' raw answers into its prompt or history.
+4. **Seal and quorum.** Contract-valid answers are staged, hashed, made read-only, freshly shuffled,
+   and copied into a blind answer bundle. Missing or partial coverage remains visible.
+5. **Reviewer/judge.** A fresh analyzer runs in opaque scratch staging containing the independent
+   context view, blind reports, and blind captured evidence. It evaluates disagreements, factual
+   risks, provenance, and validation method, then emits the final result.
 6. **Optional secondary verification.** A distinct configured analyzer can confirm, reject, or mark
    each primary finding uncertain before carry-forward.
 7. **Durable finalization.** Attributed answers, analysis, report, logs, coverage, and evidence remain
@@ -97,6 +100,9 @@ sessions/<session>/
     │   ├── analysis.json
     │   ├── accepted-analysis.json
     │   ├── blind-answers.json
+    │   ├── blind-evidence-index.json
+    │   ├── reproduction-seal.json
+    │   ├── evidence/
     │   └── answer-map.json
     ├── secondary-analysis/verification.json
     └── final/
