@@ -9,6 +9,7 @@ import shutil
 from pathlib import Path
 
 from .models import AnalyzerConfig, AppConfig, CommandSpec, ConfigError, EngineConfig
+from .claude_code import claude_code_arguments
 from .storage import managed_environment
 
 
@@ -70,6 +71,13 @@ def _executable(engine: EngineConfig) -> list[str]:
         if engine.harness_version not in {"", "unversioned", "latest"}:
             return _npx_command(f"@openai/codex@{engine.harness_version}")
         return ["codex"]
+    if engine.harness == "claude-code":
+        installed = shutil.which("claude")
+        if installed:
+            return [installed]
+        if engine.harness_version not in {"", "unversioned", "latest"}:
+            return _npx_command(f"@anthropic-ai/claude-code@{engine.harness_version}")
+        return ["claude"]
     raise ConfigError(f"no executable mapping for harness {engine.harness}")
 
 
@@ -167,13 +175,25 @@ def build_hunter_command(
         ]
         argv.extend(engine.extra_args)
         argv.append(prompt)
+    elif engine.harness == "claude-code":
+        argv = _executable(engine)
+        argv.extend(claude_code_arguments(
+            engine,
+            schema_path=answer_schema,
+            prompt=prompt,
+            hunter=True,
+        ))
     else:
         raise ConfigError(f"unsupported hunter harness: {engine.harness}")
 
+    environment = _environment(config, engine, run_id)
+    if engine.harness == "claude-code" and not engine.command:
+        # Only the explicitly supplied Swarmerz workers may be delegated to.
+        environment["CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS"] = "1"
     return CommandSpec(
         argv=tuple(argv),
         cwd=workspace,
-        env=_environment(config, engine, run_id),
+        env=environment,
         artifact_path=answer_path,
     )
 
@@ -202,9 +222,13 @@ def build_auth_probe_command(
     run_id: str,
     cwd: Path,
 ) -> CommandSpec:
+    if engine.harness == "claude-code":
+        argv = _executable(engine) + ["auth", "status", "--json"]
+    else:
+        # A private OpenCode probe must not restart or load the shared background service.
+        argv = _executable(engine) + ["auth", "list", "--standalone", "--format", "json"]
     return CommandSpec(
-        # A private probe must not restart or load the shared background service.
-        argv=tuple(_executable(engine) + ["auth", "list", "--standalone", "--format", "json"]),
+        argv=tuple(argv),
         cwd=cwd,
         env=_environment(config, engine, run_id),
         artifact_path=None,
@@ -321,7 +345,7 @@ def _build_adjudicator_command(
             "timeout_seconds": str(engine.timeout_seconds),
         }
         argv = list(_format_custom(engine.command + engine.extra_args, values))
-    else:
+    elif engine.harness in {"codex", "codex-exec"}:
         argv = _executable(engine)
         argv += [
             "exec",
@@ -346,10 +370,23 @@ def _build_adjudicator_command(
         ]
         argv.extend(engine.extra_args)
         argv.append(prompt)
+    elif engine.harness == "claude-code":
+        argv = _executable(engine)
+        argv.extend(claude_code_arguments(
+            engine,
+            schema_path=schema,
+            prompt=prompt,
+            hunter=False,
+        ))
+    else:
+        raise ConfigError(f"unsupported adjudicator harness: {engine.harness}")
 
+    environment = _environment(config, engine, run_id)
+    if engine.harness == "claude-code" and not engine.command:
+        environment["CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS"] = "1"
     return CommandSpec(
         argv=tuple(argv),
         cwd=workspace,
-        env=_environment(config, engine, run_id),
+        env=environment,
         artifact_path=result,
     )

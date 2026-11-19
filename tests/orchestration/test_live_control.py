@@ -103,6 +103,119 @@ class LiveControlTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_recoverable_claude_code_requires_targeted_followup(self) -> None:
+        async def scenario() -> None:
+            control = LiveControl()
+            control.register_claude("claude")
+            control.mark_recoverable("claude")
+
+            self.assertEqual(await control.send("continue"), [])
+            self.assertIn("Claude Code RECOVERABLE", control.status())
+            self.assertEqual(
+                await control.send("continue", "claude"),
+                ["claude: recovery instruction queued for the same Claude Code session"],
+            )
+            self.assertEqual(
+                await control.next_recovery("claude", timeout_seconds=0.01),
+                "continue",
+            )
+
+        asyncio.run(scenario())
+
+    def test_failed_claude_turn_can_resume_while_peer_is_open(self) -> None:
+        async def scenario(root: Path) -> None:
+            engine = SimpleNamespace(
+                id="claude",
+                harness="claude-code",
+                command=(),
+                timeout_seconds=10,
+                provider="anthropic",
+                effective_model="claude-mythos-5-2",
+            )
+            runner = object.__new__(AuditRunner)
+            runner.config = SimpleNamespace(
+                hunters=(engine,),
+                codex_transport_retries=0,
+                codex_retry_delay_seconds=0,
+            )
+            runner.live_control = LiveControl()
+            runner.live_control.active.update({"claude", "peer"})
+            runner._resource_limiter = None
+            messages: list[str] = []
+            runner.progress = messages.append
+            executions: list[tuple[str, ...]] = []
+
+            async def execute(
+                command: CommandSpec, **kwargs: object
+            ) -> dict[str, object]:
+                executions.append(command.argv)
+                stdout_path = Path(str(kwargs["stdout_path"]))
+                if len(executions) == 1:
+                    events = [
+                        {"type": "system", "subtype": "init", "session_id": "session-a"},
+                        {
+                            "type": "result", "session_id": "session-a",
+                            "is_error": True, "result": "request denied",
+                        },
+                    ]
+                    status = "failed"
+                    exit_code = 1
+                else:
+                    events = [{
+                        "type": "result", "session_id": "session-a",
+                        "is_error": False,
+                        "structured_output": {"answer": "continued"},
+                    }]
+                    status = "completed"
+                    exit_code = 0
+                mode = "a" if kwargs.get("append") else "w"
+                with stdout_path.open(mode, encoding="utf-8") as handle:
+                    for event in events:
+                        handle.write(json.dumps(event) + "\n")
+                Path(str(kwargs["stderr_path"])).touch()
+                return {
+                    "status": status,
+                    "exit_code": exit_code,
+                    "timed_out": False,
+                    "duration_seconds": 0,
+                }
+
+            spec = CommandSpec(
+                argv=("claude", "--print", "initial prompt"),
+                cwd=root,
+                env={},
+                artifact_path=root / "answer.json",
+            )
+            with mock.patch.object(runner, "_execute_command", side_effect=execute):
+                task = asyncio.create_task(runner._execute_with_transport_retries(
+                    engine,
+                    spec,
+                    role="claude",
+                    stdout_path=root / "stdout.jsonl",
+                    stderr_path=root / "stderr.log",
+                ))
+                for _ in range(100):
+                    if "claude" in runner.live_control.recoverable:
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertIn("claude", runner.live_control.recoverable)
+                self.assertEqual(
+                    await runner.live_control.send("continue", "claude"),
+                    ["claude: recovery instruction queued for the same Claude Code session"],
+                )
+                result = await task
+
+            self.assertEqual(result["status"], "completed")
+            self.assertTrue(result["resumed_after_failure"])
+            self.assertEqual(json.loads(spec.artifact_path.read_text()), {"answer": "continued"})
+            self.assertIn("--resume", executions[1])
+            self.assertIn("session-a", executions[1])
+            self.assertIn("continue", executions[1])
+            self.assertTrue(any("Claude Code turn failed" in item for item in messages))
+
+        with tempfile.TemporaryDirectory() as directory:
+            asyncio.run(scenario(Path(directory)))
+
     def test_failed_codex_turn_can_resume_while_peer_is_open(self) -> None:
         async def scenario(root: Path) -> None:
             engine = SimpleNamespace(

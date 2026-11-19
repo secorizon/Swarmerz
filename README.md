@@ -56,12 +56,14 @@ Requirements:
 - Linux or macOS with an interactive terminal and Python 3.12 or newer. On Windows, use WSL2;
   native Windows is not currently supported.
 - The harnesses required by your configuration. OpenCode can route to local Ollama, LAN, or hosted
-  providers; a `command` adapter can integrate another local or remote runtime.
-- Codex authentication only when the configuration includes a native Codex hunter, adjudicator, or
-  interactive follow-up. A fully local fleet does not require a Codex hunter, although a fully local
-  adjudicator currently needs a command adapter.
+  providers; Claude Code and Codex are supported directly; a `command` adapter can integrate
+  another local or remote runtime.
+- Claude Code or Codex authentication only when the configuration selects that native harness for
+  a hunter, adjudicator, or interactive follow-up. A fully local fleet needs neither, although a
+  fully local adjudicator currently needs a command adapter.
 - Node.js/npm only when a pinned harness must be resolved through `npx` rather than an installed
-  executable.
+  executable. Installed Codex, Claude Code, and OpenCode CLIs are version-probed at startup; their
+  resolved runtime versions are recorded even when a profile still names an older version.
 - Runtime Python dependencies (`prompt-toolkit` and `jsonschema`) are declared by the package and
   installed automatically. Desktop clipboard helpers are optional platform tools, not bundled
   Python dependencies.
@@ -72,6 +74,7 @@ Install the distribution into a virtual environment, then run the platform check
 python3 -m venv .venv
 .venv/bin/pip install .
 .venv/bin/swarmerz doctor
+.venv/bin/swarmerz config-models --config /absolute/path/to/swarmerz.toml
 .venv/bin/swarmerz demo
 ```
 
@@ -108,6 +111,20 @@ selected hosted adjudicator. Before a real run, review models, reasoning control
 timeouts, `minimum_answers`, environment allowlists, local inference capacity, and `output_root`.
 Availability and provider credit are checked where a harness exposes that information; local model
 inventory and tool capability are probed for native Ollama routes.
+
+`swarmerz config-models --config PATH` opens a redacted interactive catalog before launch.
+Configured native routes appear first in profile order; remaining choices are ordered Claude Code,
+Codex, then OpenCode. Configured hunters are pre-checked. Use Tab or Shift-Tab to filter by harness,
+the arrows, Page Up/Down, or the mouse wheel to scroll, `O` to discover models from a local or LAN
+Ollama URL, Space to check or uncheck a hunter model, and `J` to choose a Codex or Claude Code
+primary judge. Enter opens a staged diff, and a second Enter validates and atomically applies it.
+Ctrl-Q or Escape cancels without changing the profile. `swarmerz models --json` exposes the same
+discovery data read-only for automation. Claude Code's documented Fable, Haiku, Opus, and Sonnet
+aliases are shown alongside locally configured choices; Claude Code validates account access only
+at launch. Discovery can read local harness catalogs, sanitized authentication status, and the
+configured OpenCode or Ollama inventory endpoints, but it never sends an inference prompt or
+prints tokens, account identity, email, or organization metadata. See the
+[CLI reference](docs/cli-reference.md#config-models).
 
 ### Platform support
 
@@ -213,14 +230,16 @@ a multi-hour audit.
   exposes provider, model, harness, effort, and the latest state detail for the focused hunter.
 - Supports local-only, hosted-only, and mixed fleets; model identity is configuration rather than
   application logic.
-- Labels native Codex-backed hunters and judges by their configured model (`DAYBREAK`,
-  `GPT-5.6-SOL`, and so on), while retaining each hunter's stable configuration ID in brackets for
-  `/to`, artifacts, and replay.
+- Provides a scrollable model configurator for installed OpenCode, Codex, and Claude Code choices,
+  with hunter checkboxes, a judge marker, staged diff review, and atomic validated writes.
+- Labels native Codex- and Claude Code-backed hunters and judges by their configured model
+  (`DAYBREAK`, `GPT-5.6-SOL`, `MYTHOS-5-2`, and so on), while retaining each hunter's stable
+  configuration ID in brackets for `/to`, artifacts, and replay.
 - Turns raw progress into a timestamped, filterable signal rail.
 - Switches instantly among activity, sealed hunter reports, and final adjudicator synthesis.
-- Offers an optional `F8` judge follow-up when the primary analyzer is native Codex: `/chat` opens
-  the readable review in the current terminal, while the displayed command can be pasted into
-  another terminal tab.
+- Offers an optional `F8` judge follow-up when the primary analyzer is native Codex or Claude Code:
+  `/chat` opens the readable review in the current terminal, while the displayed command can be
+  pasted into another terminal tab.
 - Gives every workspace a real bounded viewport, visible scrollbar, line/page navigation,
   Home/End jumps, and mouse-wheel scrolling.
 - Supports broadcast and targeted steering from the same command bus.
@@ -319,7 +338,7 @@ and prompt paths are resolved from the selected configuration file.
 | `[context]` | Optional default path, symlink policy, and excluded file/directory names |
 | `[[hunters]]` | 2–26 independent local, hosted, or custom routes with model, effort, timeout, child count, and credential allowlist |
 | `workers` / `subagents` | Harness-facing child declarations; effective required fan-out is `max(workers, subagents)` |
-| `[analyzer]` | Fresh primary adjudicator; native Codex or a command adapter, with mandatory identity blinding and optional baseline-first review |
+| `[analyzer]` | Fresh primary adjudicator; native Codex, native Claude Code, or a command adapter, with mandatory identity blinding and optional baseline-first review |
 | `[secondary_analyzer]` | Optional different model/provider confirmation gate; only confirmed primary findings carry forward |
 | `[isolation]` | Workspace environment policy and optional OpenCode server topology; unrestricted environment inheritance is off by default |
 | `[resources]` | Optional Linux user-scope memory, swap, and task ceilings; safe defaults apply when the table is omitted |
@@ -337,7 +356,9 @@ fan-out, and credential allowlist. Unsupported combinations fail rather than sil
 OpenCode-hosted providers should be connected through OpenCode before launch. Native Ollama routes
 need no stored OpenCode credential; Swarmerz checks the configured endpoint for the exact model and
 for completion/tool capability. Codex can use its local authenticated session or credentials named
-in `pass_env`; unrelated host variables are not inherited unless explicitly allowed.
+in `pass_env`. Claude Code can use its existing authenticated CLI session, or an explicitly
+allowlisted `ANTHROPIC_API_KEY`; the configured `model` is always passed on the command line.
+Unrelated host variables are not inherited unless explicitly allowed.
 
 `isolation.opencode_server_mode = "shared"` is the default. Native OpenCode parents use one private
 round service and password, with workspace routing for separation; this protects ordinary operation
@@ -357,9 +378,10 @@ uses one envelope for its shared service; per-hunter mode uses one per service. 
 macOS and Linux systems without usable user scopes continue with process-group cleanup and report
 the missing containment instead of failing startup. When a restricted harness environment omits
 `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR`, Swarmerz supplies them only to the
-`systemd-run` launcher and removes those additions before OpenCode, Codex, or a command adapter
-starts. These limits contain accidental recursion and runaway tests; they are not a hostile-code
-sandbox. Reviewed fuzzing campaigns can raise or disable the ceilings explicitly in `[resources]`.
+`systemd-run` launcher and removes those additions before OpenCode, Codex, Claude Code, or a
+command adapter starts. These limits contain accidental recursion and runaway tests; they are not
+a hostile-code sandbox. Reviewed fuzzing campaigns can raise or disable the ceilings explicitly in
+`[resources]`.
 
 ### Scale and concurrency
 
@@ -406,8 +428,8 @@ data residency, latency, tool reliability, context length, hardware, and cost:
 - **Custom runtimes:** a `command` harness can call an internal gateway, another agent framework,
   or an air-gapped inference service while preserving Swarmerz's artifact contract.
 - **Local adjudication:** the primary or secondary analyzer may use a command adapter that writes
-  the required schema-conforming result. Native analyzer integration is currently Codex-specific;
-  local analyzers therefore use `harness = "command"`.
+  the required schema-conforming result. Native analyzer integrations are available for Codex and
+  Claude Code; local analyzers use `harness = "command"` unless a native local harness is added.
 
 A native local Ollama hunter looks like this; repeat the table with a distinct ID/model or approach
 because Swarmerz requires at least two independent parents:
@@ -427,6 +449,33 @@ workers = 2
 subagents = 2
 pass_env = []
 ```
+
+A native Claude Code hunter uses the account already authenticated by the installed CLI. Swarmerz
+defines exactly the configured number of named Claude workers, disables built-in agents for that
+process, and verifies their top-level `Agent` calls from the structured stream:
+
+```toml
+[[hunters]]
+id = "claude"
+harness = "claude-code"
+harness_version = "2.1.328"
+provider = "anthropic"
+model = "claude-mythos-5-2"
+reasoning_effort = "xhigh"
+timeout_seconds = 14400
+workers = 4
+subagents = 4
+pass_env = [] # OAuth login is read through the normal Claude Code account state
+```
+
+For API-key authentication instead, use `pass_env = ["ANTHROPIC_API_KEY"]`; never put the key in
+`env` or directly in the profile. Mission startup verifies authentication without making a model
+call and removes email and organization metadata from the stored probe result.
+
+Swarmerz keeps its packaged output schemas as Draft 2020-12. Claude Code receives an inline
+compatibility copy with only the top-level schema-document metadata removed, because some Claude
+Code builds do not register that metaschema URI. The materialized answer is still validated against
+the unchanged canonical schema before it can be sealed.
 
 For a local adjudicator, the adapter receives the same phase contract used by hosted review:
 
@@ -498,9 +547,11 @@ numeric indexes. Repeat the option for multiple overrides:
 ```text
 swarmerz run       Start a new round or open the stored-round picker
 swarmerz analyze   Retry primary adjudication for one incomplete round
-swarmerz chat      Open a judge follow-up when the primary analyzer is native Codex
+swarmerz chat      Open a judge follow-up when the primary analyzer is native Codex or Claude Code
 swarmerz cache     Inspect, prune, or clear disposable SSD cache data
 swarmerz doctor    Check the installation, platform helpers, and an optional deployment profile
+swarmerz models    Print the credential-free native model inventory (read-only)
+swarmerz config-models  Interactively check hunters and choose the primary judge
 swarmerz demo      Run the interface without contacting providers
 ```
 
@@ -534,7 +585,8 @@ This verifies existing seals and does not rerun hunters. Add `--adopt-late-answe
 hunter wrote a valid answer after the original run marked it failed. Adoption remains opt-in,
 requires observed worker sessions, and marks unverifiable worker outcomes accordingly.
 
-When the primary analyzer is native Codex, press `F8` or enter `/chat` after successful analysis.
+When the primary analyzer is native Codex or Claude Code, press `F8` or enter `/chat` after
+successful analysis.
 From another terminal:
 
 ```bash
@@ -543,10 +595,11 @@ From another terminal:
   --round-id 0001-round-...
 ```
 
-The first call opens a new readable Codex conversation grounded in the completed report. Add
-`--resume` to continue it later, or `--print-command` to inspect the exact Codex launch without
-starting it. Review chat prefers the installed Codex executable instead of resolving a pinned
-analyzer through `npx`. Swarmerz prints a launch notice before handing over the terminal.
+The first call opens a new readable conversation in the selected judge harness, grounded in the
+completed report. Add `--resume` to continue it later, or `--print-command` to inspect the exact
+launch without starting it. Review chat prefers the installed harness executable instead of
+resolving a pinned package through `npx`. Swarmerz prints a launch notice before handing over the
+terminal.
 
 For an editable development installation with the test dependencies:
 
@@ -574,22 +627,23 @@ installs the wheel on clean Linux and macOS runners, then executes the installed
 | `/view activity\|reports\|synthesis\|mission\|review\|help` | Change the workspace |
 | `/theme [NAME]` | List themes or select one directly |
 | `/clear` | Clear only the local signal rail; artifacts remain unchanged |
-| `/chat` | Open or resume the completed review when the primary analyzer is native Codex |
+| `/chat` | Open or resume the completed review when the primary analyzer is native Codex or Claude Code |
 | `/help` or `?` | Open the complete command map |
 | `/quit` or `/exit` | Exit only after the mission reaches a terminal state |
 
 Steering is an instruction, not a forced timeout or a guarantee of immediate completion. `Ctrl-Q`
 and `/quit` refuse to terminate active model work. Use `/wrap` to request clean consolidation.
 
-If a native Codex hunter or a native OpenCode hunter with a verified worker session fails while
-another hunter is still open, Swarmerz keeps its resumable harness state alive and marks it
-`RECOVERABLE`. Use `/to ID MESSAGE` to start a follow-up in the same Codex thread or OpenCode
-session; for example, `/to codex continue and complete the audit`.
+If a native Codex or Claude Code hunter, or a native OpenCode hunter with a verified worker session,
+fails while another hunter is still open, Swarmerz keeps its resumable harness state available and
+marks it `RECOVERABLE`. Use `/to ID MESSAGE` to start a follow-up in the same Codex thread, Claude
+Code session, or OpenCode session; for example, `/to claude continue and complete the audit`.
 Recovery is deliberately targeted: `/all` does not revive failed hunters. The recovery window
 closes when the rest of the fleet finishes, and the round records each recovery outcome plus a
 SHA-256 digest of the operator instruction without copying its text into `result.json`. OpenCode
 startup, authentication, routing, and pre-fan-out failures without a verified worker session are
-not presented as resumable. Cline and custom command adapters are not resumable through `/to`
+not presented as resumable. An active Claude Code print turn cannot accept live steering, but a
+failed turn with a persisted session ID can be resumed. Cline and custom command adapters are not resumable through `/to`
 because Swarmerz does not have a portable persistent-session contract for those processes.
 
 | Key | Effect |
@@ -728,6 +782,10 @@ copy-on-write or copied context view.
   directory containing all required local files.
 - **A provider fails before hunting:** verify its connection, model name, reasoning variant, account
   credit, and credential allowlist in `swarmerz.toml`.
+- **A configured harness version is older than the installed CLI:** this is informational for an
+  installed Codex, Claude Code, or OpenCode executable. Swarmerz uses the probed version for that
+  run, leaves the profile unchanged, and records both values under `runtime_harness_versions` in
+  the round manifest. A mismatched package actually resolved through `npx` still fails closed.
 - **A hunter is `BLOCKED`:** inspect its `worker-monitor.json` and signal rail. Swarmerz will not
   grant new filesystem or credential access during an unattended run.
 - **A harness exits after a resource limit:** inspect `manifest.json` → `resource_limits`, the
@@ -736,9 +794,9 @@ copy-on-write or copied context view.
 - **Primary analysis failed after hunters sealed:** use `swarmerz analyze`; do not start a new round
   merely to retry adjudication.
 - **Follow-up chat appears idle:** current builds print `[Swarmerz] launching readable
-  <judge-model> follow-up...` before starting the installed Codex CLI. Use
-  `swarmerz chat --print-command` to inspect the launch and confirm Codex authentication without
-  starting the review.
+  <judge-model> follow-up...` before starting the installed Codex or Claude Code CLI. Use
+  `swarmerz chat --print-command` to inspect the launch and confirm the selected harness command
+  without starting the review.
 - **A stored round is missing:** use the same `--config` and `--set output_root=...` values that
   created it.
 

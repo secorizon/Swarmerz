@@ -69,27 +69,43 @@ digit, and contain only letters, digits, dots, underscores, or hyphens.
 | Field | Required | Meaning |
 |---|---|---|
 | `id` | Yes | Stable hunter identity used in artifacts and steering. |
-| `harness` | Yes | `opencode`, `codex`, `codex-exec`, `cline`, or `command`. |
-| `harness_version` | Recommended | Exact harness pin; `unversioned` and `latest` disable an exact pin. |
+| `harness` | Yes | `opencode`, `codex`, `codex-exec`, `claude-code`, `cline`, or `command`. |
+| `harness_version` | Recommended | Recorded version and exact `npx` fallback pin. An installed native CLI takes precedence: startup probes it, uses its reported version when the profile is stale, and records configured versus resolved versions in the round manifest. `unversioned` and `latest` disable the fallback pin. |
 | `provider` | Yes in practice | Model route/provider identifier recorded for overlap analysis. |
 | `model` | Yes | Requested model identifier. |
 | `model_snapshot` | No | Exact snapshot used instead of the display model when supplied. |
 | `reasoning_effort` | Yes | Requested effort from the declared supported set. |
-| `supported_efforts` | Usually | Required for OpenCode and command routes; Codex and Cline have built-in capability rules. |
+| `supported_efforts` | Usually | Required for OpenCode and command routes; Codex, Claude Code, and Cline have built-in capability rules. |
 | `timeout_seconds` | No | Parent timeout; default `14400`. Must be positive. |
 | `workers` | Yes for hunters | Parent-requested worker count. |
 | `subagents` | No | Alternate harness fan-out declaration. Effective fan-out is `max(workers, subagents)`. |
 | `worker_timeout_seconds` | No | Optional positive timeout for a worker. |
 | `answer_path` | No | Defaults to `.swarm/answer.json`; must stay inside the workspace. |
-| `extra_args` | No | Additional harness arguments. Codex hunters cannot use `--ephemeral`. |
+| `extra_args` | No | Additional non-protocol harness arguments. Codex hunters cannot use `--ephemeral`; Claude Code routes cannot override Swarmerz's model, agent, tool, permission, session, or structured-output controls. |
 | `pass_env` | No | Names of selected host environment variables passed to the engine. |
 | `env` | No | Literal scalar environment values. Do not place credentials here. |
 | `command` | Command adapter only | Argument vector for an internal adapter. |
 | `ollama_base_url` | Ollama route only | HTTP(S) URL ending in `/v1`, without embedded credentials, query, or fragment. |
 
+For installed Codex, Claude Code, and OpenCode CLIs, the startup probe is authoritative for that
+run. Swarmerz does not silently rewrite `harness_version` in the profile. Instead,
+`manifest.json` records each engine's `configured`, `resolved`, and `source` values under
+`runtime_harness_versions`, and all downstream launch metadata uses the resolved version. Exact
+version enforcement remains fail-closed when Swarmerz must resolve the configured package through
+`npx`.
+
 Every hunter must configure an effective fan-out of at least two. Swarmerz asks the parent to create
 that many focused workstreams and records the available harness evidence; it does not claim that a
 session count proves semantic independence.
+
+Native Claude Code parents receive exactly that many named custom agents. Built-in agents are
+disabled for the process, and Swarmerz verifies the top-level `Agent` call IDs and configured agent
+names before sealing the answer. This attests observable delegation, not distinct reasoning quality.
+
+Swarmerz passes Claude Code an inline output schema after removing only the top-level `$schema` and
+`$comment` document metadata. This avoids a Claude Code validator error on the Draft 2020-12
+metaschema URI; it does not weaken Swarmerz's artifact contract. The canonical packaged schema is
+unchanged and validates the materialized answer before sealing.
 
 Reasoning efforts are `default`, `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`.
 Only values explicitly supported by the selected harness/model combination are accepted.
@@ -98,7 +114,8 @@ Only values explicitly supported by the selected harness/model combination are a
 
 The `[analyzer]` table uses the common engine fields with these additional rules:
 
-- Supported harnesses are native Codex (`codex` or `codex-exec`) and `command`.
+- Supported harnesses are native Codex (`codex` or `codex-exec`), native Claude Code
+  (`claude-code`), and `command`.
 - `blind_hunter_identity` must remain `true`.
 - `baseline_first` defaults to `false`. When enabled, the analyzer runs once before hunter answers
   are disclosed and again after quorum for final adjudication.
@@ -146,10 +163,11 @@ tasks_max = 512
 ```
 
 On Linux, Swarmerz verifies the user systemd manager before launching a harness. Each native Codex,
-command-adapter, and adjudicator process tree receives its own transient scope. A shared OpenCode
-service has one envelope covering all native OpenCode hunters attached to that service;
-`opencode_server_mode = "per_hunter"` gives each service a separate envelope. The controller stays
-outside these scopes, so a limit event can fail the affected harness without killing the deck.
+native Claude Code, command-adapter, and adjudicator process tree receives its own transient scope.
+A shared OpenCode service has one envelope covering all native OpenCode hunters attached to that
+service; `opencode_server_mode = "per_hunter"` gives each service a separate envelope. The
+controller stays outside these scopes, so a limit event can fail the affected harness without
+killing the deck.
 
 In `auto` mode, macOS and Linux installations without a usable user-systemd manager continue with
 process-group timeout cleanup and emit a warning. Use `required` when a deployment must refuse an
@@ -181,6 +199,14 @@ Do not store API keys, session tokens, private keys, or passwords in the profile
 authenticated local session or list only the required variable names in `pass_env`. Unlisted host
 variables are not inherited when environment inheritance is disabled.
 
+Native Claude Code can use the login established by `claude auth login` because `HOME` remains in
+the minimal harness environment. Swarmerz passes the profile's exact model and effort explicitly,
+so a model selected in the user's Claude settings does not silently override the deployment
+profile. Startup runs `claude auth status --json`, then stores only `loggedIn`, `authMethod`, and
+`apiProvider`; email, organization, and other account metadata are discarded. Swarmerz does not
+copy, rewrite, or log the Claude credential state. API-key deployments must name
+`ANTHROPIC_API_KEY` in `pass_env`, not place its value in `env`.
+
 Per-hunter OpenCode mode intentionally does not reuse the user's shared OpenCode auth store. Each
 private server reports the environment-variable names supported by its selected provider. Swarmerz
 forwards only matching non-empty values from the launch environment, then confirms that OpenCode
@@ -189,6 +215,36 @@ registered the environment connection. Custom provider variables can still be na
 and it removes each hunter's temporary OpenCode HOME and database when that hunter stops. A provider
 authenticated only through saved OAuth or token-plan state must use shared mode or a dedicated
 environment credential.
+
+## Model inventory and assisted profile edits
+
+Run `swarmerz config-models --config PATH` to open a scrollable catalog for the native harnesses
+installed for the current user. Current hunters are pre-checked. Space stages hunter additions or
+removals, `J` stages a native Codex/Claude Code judge, and Enter opens a diff before applying it.
+Command-adapter hunters are preserved because a provider catalog cannot reconstruct their commands.
+The read-only `swarmerz models --config PATH [--json]` command exposes the same discovery data for
+diagnostics and automation.
+
+Discovery reads OpenCode's live project catalog and connected-provider markers, Codex's local
+ChatGPT model cache, and Claude Code's local model selection, allowlist, advertised aliases, and
+documented Fable, Haiku, Opus, and Sonnet aliases. Tab and Shift-Tab filter the interactive catalog
+by harness. The combined view lists configured native routes first in profile order, then
+unconfigured Claude Code, Codex, and OpenCode choices. It does not print connection objects,
+authentication identity, environment values, or tokens, and it does not send an inference request.
+On confirmation, Swarmerz writes one temporary sibling profile and runs the complete configuration
+validator against it. The original path is atomically replaced only if validation succeeds.
+Comments outside removed hunter tables or the replaced analyzer table remain intact.
+
+Press `O` in the configurator to enter an Ollama URL. Swarmerz reads `/api/tags` from that local or
+LAN server directly, without a shell proxy, and adds the returned models to the OpenCode filter.
+Bare hosts use HTTP and Ollama's default port `11434`; selected models retain the normalized `/v1`
+URL in their generated hunter table. Endpoints already present in configured Ollama hunters are
+rediscovered automatically when the catalog opens. Discovery caps the catalog response at 4 MiB
+and does not load a model; the existing launch preflight checks tool and completion capabilities.
+
+OpenCode remains a native hunter harness, not a native analyzer harness. To use an OpenCode-routed
+or other runtime as judge, keep using an explicit `command` adapter. See the
+[CLI reference](cli-reference.md#config-models) for the complete key map and write behavior.
 
 ## One-run overrides
 

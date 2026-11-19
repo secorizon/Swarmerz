@@ -11,10 +11,12 @@ import os
 import re
 import shutil
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from .adapters import build_hunter_command
+from .claude_code import claude_fanout_evidence, is_native_claude
 from .artifacts import (
     collect_partial_notes,
     read_json,
@@ -25,7 +27,7 @@ from .artifacts import (
 )
 from .fanout import build_fanout_manifest, fanout_summary
 from .instructions import build_hunter_instruction
-from .models import CommandSpec, ConfigError, EngineConfig
+from .models import AppConfig, CommandSpec, ConfigError, EngineConfig
 from .opencode_permissions import OpenCodeEndpoint
 from .opencode_server import (
     IsolatedOpenCodeServer,
@@ -43,6 +45,40 @@ _HARD_OPENCODE_PROVIDER_FAILURE_MARKERS = (
     "authentication failed",
 )
 _OPENCODE_PROVIDER_ERROR = re.compile(r"(?<![a-z0-9_.-])provider\.[a-z0-9_-]+")
+
+
+def _reported_harness_version(output: str) -> str | None:
+    match = re.search(
+        r"(?<![0-9])([0-9]+(?:\.[0-9]+)+(?:[-+][A-Za-z0-9.-]+)?)(?![0-9])",
+        output,
+    )
+    return match.group(1) if match is not None else None
+
+
+def _probe_uses_npx(spec: CommandSpec) -> bool:
+    return Path(spec.argv[0]).name.lower() in {"npx", "npx.cmd", "npx.exe"}
+
+
+def _with_resolved_harness_versions(
+    config: AppConfig,
+    versions: dict[tuple[str, str], str],
+) -> AppConfig:
+    def resolve(engine: EngineConfig) -> EngineConfig:
+        if engine.command:
+            return engine
+        version = versions.get((engine.harness, engine.harness_version))
+        return replace(engine, harness_version=version) if version else engine
+
+    return replace(
+        config,
+        hunters=tuple(resolve(engine) for engine in config.hunters),
+        analyzer=resolve(config.analyzer),
+        secondary_analyzer=(
+            resolve(config.secondary_analyzer)
+            if config.secondary_analyzer is not None
+            else None
+        ),
+    )
 
 
 def _is_terminal_opencode_provider_failure(
@@ -282,6 +318,8 @@ class HunterExecutionMixin:
         setup_root = self.run_dir / "setup"
         setup_root.mkdir(parents=True, exist_ok=True)
         seen: set[tuple[str, str]] = set()
+        resolved_versions: dict[tuple[str, str], str] = {}
+        resolution_sources: dict[tuple[str, str], str] = {}
         for engine in (*self.config.hunters, *adjudicators):
             key = (engine.harness, engine.harness_version)
             if key in seen:
@@ -322,15 +360,59 @@ class HunterExecutionMixin:
                 )
             version = (role_dir / "stdout.log").read_text(encoding="utf-8", errors="replace").strip()
             expected = engine.harness_version
-            if expected not in {"", "unversioned", "latest"} and not re.search(
+            pinned_mismatch = expected not in {"", "unversioned", "latest"} and not re.search(
                 rf"(?<![0-9]){re.escape(expected)}(?![0-9])",
                 version,
-            ):
-                raise ConfigError(
-                    f"{engine.harness} version mismatch: configured {expected}, probe returned "
-                    f"{version or '<empty>'}"
+            )
+            reported = _reported_harness_version(version)
+            uses_npx = _probe_uses_npx(spec)
+            if pinned_mismatch:
+                if uses_npx or reported is None:
+                    raise ConfigError(
+                        f"{engine.harness} version mismatch: configured {expected}, "
+                        f"probe returned {version or '<empty>'}"
+                    )
+                self._emit(
+                    f"[setup] {engine.harness} configured {expected}; using installed "
+                    f"{reported} and recording the resolved runtime version"
                 )
+            if reported is not None:
+                resolved_versions[key] = reported
+                resolution_sources[key] = "npx" if uses_npx else "installed"
             self._emit(f"[setup] ready: {version or engine.harness}")
+
+        if resolved_versions:
+            configured = self.config
+            runtime_versions: dict[str, dict[str, str]] = {}
+            for engine in (*configured.hunters, *adjudicators):
+                if engine.command:
+                    continue
+                key = (engine.harness, engine.harness_version)
+                resolved = resolved_versions.get(key)
+                if resolved is None:
+                    continue
+                runtime_versions[engine.id] = {
+                    "configured": engine.harness_version,
+                    "resolved": resolved,
+                    "source": resolution_sources[key],
+                }
+            self.config = _with_resolved_harness_versions(
+                configured,
+                resolved_versions,
+            )
+            if self.manifest:
+                self._update_manifest(
+                    runtime_harness_versions=runtime_versions,
+                    hunters=[
+                        _engine_manifest(engine) for engine in self.config.hunters
+                    ],
+                    analyzer=_engine_manifest(self.config.analyzer),
+                    secondary_analyzer=(
+                        _engine_manifest(self.config.secondary_analyzer)
+                        if self.config.secondary_analyzer is not None
+                        else None
+                    ),
+                )
 
         opencode_engines = [
             engine
@@ -383,6 +465,57 @@ class HunterExecutionMixin:
                     f"before starting the swarm{suffix}"
                 )
             self._emit(f"[setup] OpenCode provider authentication ready: {provider_names}")
+
+        runtime_adjudicators = (self.config.analyzer,) + (
+            (self.config.secondary_analyzer,)
+            if self.config.secondary_analyzer is not None
+            else ()
+        )
+        claude_engines = [
+            engine
+            for engine in (*self.config.hunters, *runtime_adjudicators)
+            if is_native_claude(engine)
+        ]
+        for engine in claude_engines:
+            auth_dir = setup_root / f"{engine.id}-auth"
+            self._emit(f"[setup] checking Claude Code authentication for {engine.id}")
+            auth_spec = self._build_auth_probe_command(
+                self.config,
+                engine,
+                run_id=f"{self.session_id}/{self.round_id}/auth/{engine.id}",
+                cwd=self.run_dir,
+            )
+            auth_result = await self._execute_command(
+                auth_spec,
+                timeout_seconds=60,
+                stdout_path=auth_dir / "stdout.json",
+                stderr_path=auth_dir / "stderr.log",
+            )
+            write_json(auth_dir / "result.json", auth_result)
+            try:
+                status = read_json(auth_dir / "stdout.json")
+            except (ConfigError, OSError):
+                status = {}
+            # `claude auth status` also returns account email and organization
+            # metadata. Retain only non-identifying readiness fields in the run.
+            if isinstance(status, dict):
+                write_json(auth_dir / "stdout.json", {
+                    "loggedIn": status.get("loggedIn") is True,
+                    "authMethod": status.get("authMethod"),
+                    "apiProvider": status.get("apiProvider"),
+                })
+            if (
+                auth_result.get("status") != "completed"
+                or not isinstance(status, dict)
+                or status.get("loggedIn") is not True
+            ):
+                detail = self._diagnostic_tail(auth_dir / "stderr.log")
+                suffix = f": {detail}" if detail else ""
+                raise ConfigError(
+                    f"Claude Code authentication is unavailable for {engine.id}. "
+                    f"Run `claude auth login` before starting the swarm{suffix}"
+                )
+            self._emit(f"[setup] Claude Code authentication ready for {engine.id}")
 
     async def _run_hunters(self) -> list[dict[str, Any]]:
         prepared = [self._prepare_hunter(engine) for engine in self.config.hunters]
@@ -460,6 +593,7 @@ class HunterExecutionMixin:
             if self.live_control is not None and endpoint is not None:
                 self.live_control.register_opencode(engine.id, endpoint)
             native_opencode = engine.harness == "opencode" and not engine.command
+            native_claude = is_native_claude(engine)
             session_id: str | None = None
             worker_monitor: dict[str, Any] | None = None
             parent_forced_stop: dict[str, Any] | None = None
@@ -645,6 +779,22 @@ class HunterExecutionMixin:
             if self.live_control is not None:
                 self.live_control.parent_returned(engine.id)
             result.update({"hunter_id": engine.id, "answer_sealed": False})
+            if native_claude:
+                claude_workers = claude_fanout_evidence(stdout_path, engine.swarm_size)
+                result["worker_monitor"] = claude_workers
+                result["worker_contract_verified"] = bool(claude_workers["verified"])
+                result["fanout_evidence"] = (
+                    "observed_claude_agent_calls"
+                    if result["worker_contract_verified"]
+                    else "unverified"
+                )
+                snapshot = claude_workers["snapshot"]
+                result["worker_completion"] = {
+                    "terminal": int(snapshot.get("terminal_workers") or 0),
+                    "expected": engine.swarm_size,
+                    "complete": bool(snapshot.get("all_workers_terminal")),
+                    "reason": claude_workers["reason"],
+                }
             if engine.command or engine.harness == "command":
                 ledger = verify_worker_ledger(
                     spec.cwd, artifact_dir, minimum_workers=engine.swarm_size
@@ -664,6 +814,26 @@ class HunterExecutionMixin:
                 nonlocal sealed_answer
                 if result["answer_sealed"]:
                     return True
+                if native_claude:
+                    claude_workers = claude_fanout_evidence(
+                        stdout_path, engine.swarm_size
+                    )
+                    result["worker_monitor"] = claude_workers
+                    result["worker_contract_verified"] = bool(claude_workers["verified"])
+                    result["fanout_evidence"] = (
+                        "observed_claude_agent_calls"
+                        if result["worker_contract_verified"]
+                        else "unverified"
+                    )
+                    if not result["worker_contract_verified"]:
+                        observed = int(
+                            claude_workers["snapshot"].get("observed_workers") or 0
+                        )
+                        result["artifact_error"] = (
+                            f"Claude Code launched {observed}/{engine.swarm_size} "
+                            "verifiable Swarmerz worker agents"
+                        )
+                        return False
                 if engine.command or engine.harness == "command":
                     ledger = verify_worker_ledger(
                         spec.cwd, artifact_dir, minimum_workers=engine.swarm_size

@@ -39,6 +39,7 @@ class LiveControl:
     def __init__(self, labels: dict[str, str] | None = None) -> None:
         self.opencode: dict[str, OpenCodeTarget] = {}
         self.codex: dict[str, CodexAppServer] = {}
+        self.claude: set[str] = set()
         self.active: set[str] = set()
         self.recoverable: set[str] = set()
         self._recovery_instructions: dict[str, asyncio.Queue[str]] = {}
@@ -60,8 +61,18 @@ class LiveControl:
         self._recovery_instructions.pop(hunter_id, None)
         self.active.add(hunter_id)
 
+    def register_claude(self, hunter_id: str) -> None:
+        self.claude.add(hunter_id)
+        self.recoverable.discard(hunter_id)
+        self._recovery_instructions.pop(hunter_id, None)
+        self.active.add(hunter_id)
+
     def mark_recoverable(self, hunter_id: str) -> None:
-        if hunter_id not in self.codex and hunter_id not in self.opencode:
+        if (
+            hunter_id not in self.codex
+            and hunter_id not in self.opencode
+            and hunter_id not in self.claude
+        ):
             raise RuntimeError(f"{hunter_id}: no resumable harness session")
         self.active.discard(hunter_id)
         self.recoverable.add(hunter_id)
@@ -109,6 +120,7 @@ class LiveControl:
         if hunter_id in self.opencode:
             self.opencode[hunter_id].active = False
         self.codex.pop(hunter_id, None)
+        self.claude.discard(hunter_id)
 
     def status(self) -> str:
         visible = self.active | self.recoverable
@@ -120,7 +132,11 @@ class LiveControl:
             if label != hunter_id:
                 label = f"{label} ({hunter_id})"
             if hunter_id in self.recoverable:
-                harness = "Codex" if hunter_id in self.codex else "OpenCode"
+                harness = (
+                    "Codex" if hunter_id in self.codex else
+                    "Claude Code" if hunter_id in self.claude else
+                    "OpenCode"
+                )
                 parts.append(
                     f"{label}: {harness} RECOVERABLE; use /to {hunter_id} MESSAGE"
                 )
@@ -130,6 +146,8 @@ class LiveControl:
             elif hunter_id in self.codex:
                 client = self.codex[hunter_id]
                 parts.append(f"{label}: Codex {'ready' if client.turn_id else 'starting'}")
+            elif hunter_id in self.claude:
+                parts.append(f"{label}: Claude Code running")
             elif hunter_id in self.started:
                 parts.append(f"{label}: started; steering transport not ready")
             else:
@@ -149,7 +167,11 @@ class LiveControl:
                     continue
                 try:
                     queue.put_nowait(message)
-                    harness = "Codex thread" if hunter_id in self.codex else "OpenCode session"
+                    harness = (
+                        "Codex thread" if hunter_id in self.codex else
+                        "Claude Code session" if hunter_id in self.claude else
+                        "OpenCode session"
+                    )
                     outcomes.append(
                         f"{hunter_id}: recovery instruction queued for the same {harness}"
                     )
@@ -168,6 +190,12 @@ class LiveControl:
                     outcomes.append(f"{hunter_id}: delivered to active Codex turn")
                 except (RuntimeError, TimeoutError, OSError, ConfigError) as exc:
                     outcomes.append(f"{hunter_id}: not delivered ({exc})")
+                continue
+            if hunter_id in self.claude:
+                outcomes.append(
+                    f"{hunter_id}: active Claude Code print sessions cannot be steered; "
+                    "a targeted instruction can resume this session if it fails"
+                )
                 continue
             target = self.opencode.get(hunter_id)
             if target is None:

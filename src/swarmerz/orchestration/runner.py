@@ -36,6 +36,11 @@ from .artifacts import (
 )
 from .codex_models import check_chatgpt_codex_models
 from .codex_appserver import CodexAppServer
+from .claude_code import (
+    claude_resume_spec as _claude_resume_spec,
+    is_native_claude,
+    materialize_claude_output,
+)
 from .execution import execute
 from .fanout import (
     answer_postdates_workers as _answer_postdates_workers,
@@ -89,7 +94,7 @@ _SAFE_ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,95}$")
 def _hunter_progress_name(engine: EngineConfig) -> str:
     if engine.provider == "ollama":
         return engine.effective_model
-    if engine.harness in {"codex", "codex-exec"} and not engine.command:
+    if engine.harness in {"codex", "codex-exec", "claude-code"} and not engine.command:
         return display_model_name(engine.effective_model)
     return engine.id
 
@@ -356,7 +361,12 @@ def _json_error_diagnostic(path: Path) -> str | None:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if not isinstance(event, dict) or event.get("type") not in {"error", "turn.failed"}:
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "result" and event.get("is_error"):
+            error = event.get("result") or event.get("error") or event.get("subtype")
+            return str(error or "Claude Code returned an error result")[-1_500:]
+        if event.get("type") not in {"error", "turn.failed"}:
             continue
         error = event.get("error") or event.get("message")
         if isinstance(error, str):
@@ -592,6 +602,37 @@ def _live_event_summary(harness: str, stream: str, line: str) -> str | None:
             )
         return f"ERROR: {_event_error(event) or _excerpt(event)}"
 
+    if harness == "claude-code":
+        if event_type == "system" and event.get("subtype") == "init":
+            return "session initialized"
+        if event_type == "assistant":
+            message = event.get("message") if isinstance(event.get("message"), dict) else {}
+            content = message.get("content") if isinstance(message.get("content"), list) else []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "text" and block.get("text"):
+                    prefix = "worker message" if event.get("parent_tool_use_id") else "message"
+                    return f"{prefix}: {_excerpt(block['text'])}"
+                if block.get("type") == "tool_use":
+                    tool = str(block.get("name") or "tool")
+                    inputs = block.get("input") if isinstance(block.get("input"), dict) else {}
+                    detail = (
+                        inputs.get("description")
+                        or inputs.get("command")
+                        or inputs.get("pattern")
+                        or inputs.get("file_path")
+                    )
+                    suffix = f": {_excerpt(detail)}" if detail else ""
+                    return f"tool {tool} (started){suffix}"
+        if event_type == "result":
+            if event.get("is_error"):
+                detail = event.get("result") or event.get("error") or event.get("subtype")
+                return f"ERROR: {_excerpt(detail or event)}"
+            usage = event.get("usage")
+            return f"turn completed; usage={_excerpt(usage)}" if usage else "turn completed"
+        return None
+
     if harness == "opencode":
         part = event.get("part") if isinstance(event.get("part"), dict) else {}
         if event_type == "text" and part.get("text"):
@@ -820,6 +861,15 @@ class AuditRunner(SessionLifecycleMixin, HunterExecutionMixin, AdjudicationMixin
         stderr_path: Path,
     ) -> dict[str, Any]:
         is_native_codex = engine.harness in {"codex", "codex-exec"} and not engine.command
+        native_claude = is_native_claude(engine)
+        claude_hunter = bool(
+            self.live_control is not None
+            and native_claude
+            and role == engine.id
+            and role in {hunter.id for hunter in self.config.hunters}
+        )
+        if claude_hunter:
+            self.live_control.register_claude(role)
         if (
             self.live_control is not None and is_native_codex
             and role == engine.id
@@ -944,6 +994,16 @@ class AuditRunner(SessionLifecycleMixin, HunterExecutionMixin, AdjudicationMixin
                 on_output=self._live_output(role, engine.harness),
                 append=attempt > 0,
             )
+            claude_inspection: dict[str, Any] = {}
+            if native_claude:
+                claude_inspection = materialize_claude_output(
+                    stdout_path, spec.artifact_path
+                )
+                session_id = claude_inspection.get("session_id")
+                if isinstance(session_id, str) and session_id:
+                    result["claude_session_id"] = session_id
+                if claude_inspection.get("result_error") and not result.get("error"):
+                    result["error"] = str(claude_inspection["result_error"])
             diagnostic = _diagnostic_tail(stderr_path) or _json_error_diagnostic(stdout_path)
             attempts.append({**result, "diagnostic": diagnostic})
 
@@ -964,6 +1024,102 @@ class AuditRunner(SessionLifecycleMixin, HunterExecutionMixin, AdjudicationMixin
             )
             if delay:
                 await asyncio.sleep(delay)
+
+        if claude_hunter:
+            session_id = result.get("claude_session_id")
+            artifact_ready = False
+            if spec.artifact_path and spec.artifact_path.is_file():
+                try:
+                    artifact_ready = isinstance(read_json(spec.artifact_path), dict)
+                except (ConfigError, OSError):
+                    artifact_ready = False
+            initial_failure = dict(result) if not artifact_ready else None
+            recovery_attempts: list[dict[str, Any]] = []
+            while (
+                not artifact_ready
+                and isinstance(session_id, str)
+                and session_id
+                and (
+                    self.live_control.recovery_window_open(role)
+                    or self.live_control.has_pending_recovery(role)
+                )
+            ):
+                self.live_control.mark_recoverable(role)
+                detail = str(
+                    result.get("error")
+                    or result.get("status")
+                    or "no valid structured answer"
+                )
+                self._emit(
+                    f"[{_hunter_progress_name(engine)}] Claude Code turn failed; recovery "
+                    f"available while other hunters run. Use /to {role} MESSAGE to resume "
+                    f"the same session. Detail: {detail[:240]}"
+                )
+                followup: str | None = None
+                while (
+                    self.live_control.recovery_window_open(role)
+                    or self.live_control.has_pending_recovery(role)
+                ):
+                    followup = await self.live_control.next_recovery(role)
+                    if followup is not None:
+                        break
+                if followup is None:
+                    break
+                self.live_control.mark_resuming(role)
+                self._emit(
+                    f"[{_hunter_progress_name(engine)}] resuming recoverable Claude Code "
+                    "session from targeted operator instruction"
+                )
+                recovery_spec = _claude_resume_spec(spec, session_id, followup)
+                recovery_started = time.monotonic()
+                recovery_result = await self._execute_command(
+                    recovery_spec,
+                    timeout_seconds=engine.timeout_seconds,
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                    on_output=self._live_output(role, engine.harness),
+                    append=True,
+                )
+                inspection = materialize_claude_output(stdout_path, spec.artifact_path)
+                resumed_session = inspection.get("session_id")
+                if isinstance(resumed_session, str) and resumed_session:
+                    session_id = resumed_session
+                    recovery_result["claude_session_id"] = session_id
+                if inspection.get("result_error"):
+                    recovery_result["error"] = str(inspection["result_error"])
+                recovery_result["duration_seconds"] = round(
+                    time.monotonic() - recovery_started, 3
+                )
+                recovery_attempts.append({
+                    "instruction_sha256": hashlib.sha256(
+                        followup.encode("utf-8")
+                    ).hexdigest(),
+                    **recovery_result,
+                })
+                result = recovery_result
+                try:
+                    artifact_ready = bool(
+                        spec.artifact_path
+                        and spec.artifact_path.is_file()
+                        and isinstance(read_json(spec.artifact_path), dict)
+                    )
+                except (ConfigError, OSError):
+                    artifact_ready = False
+            if recovery_attempts:
+                result = dict(result)
+                result["initial_failure"] = initial_failure
+                result["recovery_attempts"] = recovery_attempts
+                result["recovery_count"] = len(recovery_attempts)
+                result["resumed_after_failure"] = artifact_ready
+                result["duration_seconds"] = round(
+                    float((initial_failure or {}).get("duration_seconds") or 0)
+                    + sum(
+                        float(item.get("duration_seconds") or 0)
+                        for item in recovery_attempts
+                    ),
+                    3,
+                )
+            self.live_control.finished(role)
 
         result = dict(result)
         result["retry_count"] = len(attempts) - 1

@@ -114,6 +114,16 @@ def test_doctor_is_part_of_the_public_cli() -> None:
     assert args.json_output is True
 
 
+def test_model_inventory_and_interactive_configurator_are_public_cli_commands() -> None:
+    listed = _parser().parse_args(["models", "--json"])
+    interactive = _parser().parse_args(["config-models", "--config", "fleet.toml"])
+
+    assert listed.command == "models"
+    assert listed.json_output is True
+    assert interactive.command == "config-models"
+    assert interactive.config == Path("fleet.toml")
+
+
 def test_startup_surfaces_optional_platform_helper_warning() -> None:
     warning = "Optional clipboard warning: install wl-clipboard."
 

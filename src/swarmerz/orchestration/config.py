@@ -30,8 +30,60 @@ from .models import (
 
 _SAFE_ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$")
 _CODEX_HARNESSES = {"codex", "codex-exec"}
-_ANALYZER_HARNESSES = {*_CODEX_HARNESSES, "command"}
-_KNOWN_HARNESSES = {"cline", "opencode", "codex", "codex-exec", "command"}
+_CLAUDE_HARNESSES = {"claude-code"}
+_ANALYZER_HARNESSES = {*_CODEX_HARNESSES, *_CLAUDE_HARNESSES, "command"}
+_KNOWN_HARNESSES = {
+    "cline", "opencode", "codex", "codex-exec", "claude-code", "command",
+}
+_CLAUDE_PROTECTED_OPTIONS = {
+    "-c",
+    "-p",
+    "-r",
+    "-w",
+    "--add-dir",
+    "--agent",
+    "--agents",
+    "--allow-dangerously-skip-permissions",
+    "--allowedTools",
+    "--allowed-tools",
+    "--append-system-prompt",
+    "--append-system-prompt-file",
+    "--bare",
+    "--chrome",
+    "--continue",
+    "--dangerously-skip-permissions",
+    "--disable-slash-commands",
+    "--effort",
+    "--file",
+    "--fork-session",
+    "--forward-subagent-text",
+    "--from-pr",
+    "--ide",
+    "--input-format",
+    "--json-schema",
+    "--mcp-config",
+    "--model",
+    "--no-chrome",
+    "--no-session-persistence",
+    "--output-format",
+    "--permission-mode",
+    "--permission-prompts",
+    "--plugin-dir",
+    "--plugin-url",
+    "--print",
+    "--remote-control",
+    "--resume",
+    "--restricted",
+    "--safe-mode",
+    "--session-id",
+    "--setting-sources",
+    "--settings",
+    "--strict-mcp-config",
+    "--system-prompt",
+    "--system-prompt-file",
+    "--tools",
+    "--worktree",
+}
 
 
 def _required(table: dict[str, Any], key: str, where: str) -> Any:
@@ -58,7 +110,8 @@ def _parse_engine(table: dict[str, Any], where: str, *, analyzer: bool = False) 
         raise ConfigError(f"{where}.harness is unsupported: {harness}")
     if analyzer and harness not in _ANALYZER_HARNESSES:
         raise ConfigError(
-            f"{where}.harness must be Codex-backed or an explicit command adapter; got {harness}"
+            f"{where}.harness must be Codex-backed, Claude Code-backed, or an "
+            f"explicit command adapter; got {harness}"
         )
 
     effort = str(_required(table, "reasoning_effort", where)).lower()
@@ -75,6 +128,15 @@ def _parse_engine(table: dict[str, Any], where: str, *, analyzer: bool = False) 
             )
     elif harness in _CODEX_HARNESSES:
         supported_efforts = declared_efforts or ("minimal", "low", "medium", "high", "xhigh")
+    elif harness in _CLAUDE_HARNESSES:
+        claude_efforts = ("low", "medium", "high", "xhigh", "max")
+        supported_efforts = declared_efforts or claude_efforts
+        impossible = set(supported_efforts) - set(claude_efforts)
+        if impossible:
+            raise ConfigError(
+                f"{where}.supported_efforts contains values the Claude Code CLI "
+                f"cannot select: {sorted(impossible)}"
+            )
     else:
         if not declared_efforts:
             raise ConfigError(
@@ -153,6 +215,17 @@ def _parse_engine(table: dict[str, Any], where: str, *, analyzer: bool = False) 
             else None
         ),
     }
+    if harness in _CLAUDE_HARNESSES and not command:
+        protected = sorted({
+            token.split("=", 1)[0]
+            for token in common["extra_args"]
+            if token.split("=", 1)[0] in _CLAUDE_PROTECTED_OPTIONS
+        })
+        if protected:
+            raise ConfigError(
+                f"{where}.extra_args cannot override Claude Code protocol options: "
+                + ", ".join(protected)
+            )
     if common["workers"] <= 0 or common["subagents"] < 0:
         raise ConfigError(f"{where}.workers must be positive and subagents must be non-negative")
     if (

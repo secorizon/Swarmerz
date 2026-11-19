@@ -5,12 +5,14 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from swarmerz.cli import main
 from swarmerz.doctor import (
     Diagnostic,
+    _engine_diagnostic,
     clipboard_startup_warning,
     collect_diagnostics,
     diagnostics_exit_code,
@@ -90,3 +92,21 @@ def test_doctor_returns_failure_only_for_required_components(
     payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == "error"
     assert payload["errors"] == 1
+
+
+def test_doctor_detects_native_claude_code() -> None:
+    engine = SimpleNamespace(
+        id="claude",
+        command=(),
+        harness="claude-code",
+        harness_version="2.1.328",
+    )
+
+    diagnostic = _engine_diagnostic(
+        engine,
+        lambda name: "/home/test/.local/bin/claude" if name == "claude" else None,
+    )
+
+    assert diagnostic == Diagnostic(
+        "harness:claude", "ok", "claude-code: /home/test/.local/bin/claude"
+    )

@@ -17,6 +17,8 @@ credential handling, isolation modes, and storage policy.
   analyzer command with the team's schema-aware local judge adapter.
 - The product-root `swarmerz.toml` is the larger hosted example. It demonstrates a heterogeneous
   fleet and native Codex adjudication; it is not a required or preferred roster.
+- Native Claude Code can be added as either a hunter or adjudicator with
+  `harness = "claude-code"`; use the exact model available to the authenticated Claude account.
 
 Run an example explicitly:
 

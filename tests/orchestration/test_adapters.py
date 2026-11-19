@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import json
 import os
 import sys
@@ -19,6 +20,12 @@ from swarmerz.orchestration.adapters import (
     build_analyzer_command,
     build_auth_probe_command,
     build_hunter_command,
+)
+from swarmerz.orchestration.claude_code import (
+    claude_fanout_evidence,
+    claude_resume_spec,
+    inspect_claude_stream,
+    materialize_claude_output,
 )
 from swarmerz.orchestration.artifacts import attribute_analysis, build_blind_bundle, write_final_report
 from swarmerz.orchestration.execution import execute
@@ -46,6 +53,240 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 class AdapterTests(unittest.TestCase):
+    def _claude_engine(self):
+        config = load_config(PROJECT_ROOT / "swarmerz.toml")
+        codex = next(item for item in config.hunters if item.harness == "codex-exec")
+        return config, replace(
+            codex,
+            id="claude",
+            harness="claude-code",
+            harness_version="2.1.328",
+            provider="anthropic",
+            model="claude-mythos-5-2",
+            model_snapshot=None,
+            reasoning_effort="xhigh",
+            supported_efforts=("low", "medium", "high", "xhigh", "max"),
+            pass_env=(),
+        )
+
+    def test_pinned_claude_code_prefers_installed_executable(self) -> None:
+        _config, engine = self._claude_engine()
+        with mock.patch(
+            "swarmerz.orchestration.adapters.shutil.which",
+            return_value="/opt/bin/claude",
+        ):
+            self.assertEqual(_executable(engine), ["/opt/bin/claude"])
+        with mock.patch(
+            "swarmerz.orchestration.adapters.shutil.which",
+            side_effect=lambda name: "/usr/bin/npx" if name == "npx" else None,
+        ):
+            self.assertEqual(
+                _executable(engine),
+                [
+                    "/usr/bin/npx", "--yes",
+                    "@anthropic-ai/claude-code@2.1.328",
+                ],
+            )
+
+    def test_claude_hunter_uses_explicit_workers_and_structured_stream(self) -> None:
+        config, engine = self._claude_engine()
+        with TemporaryDirectory() as directory, mock.patch(
+            "swarmerz.orchestration.adapters.shutil.which",
+            return_value="/opt/bin/claude",
+        ):
+            root = Path(directory)
+            spec = build_hunter_command(
+                config,
+                engine,
+                run_id="test",
+                workspace=root / "workspace",
+                artifact_dir=root / "artifacts",
+                prompt="Inspect the target",
+                prompt_file=root / "artifacts" / "instruction.md",
+            )
+        self.assertEqual(spec.argv[0], "/opt/bin/claude")
+        self.assertIn("--print", spec.argv)
+        self.assertIn("stream-json", spec.argv)
+        self.assertIn("--restricted", spec.argv)
+        self.assertIn("--strict-mcp-config", spec.argv)
+        self.assertIn("--json-schema", spec.argv)
+        inline_schema = json.loads(spec.argv[spec.argv.index("--json-schema") + 1])
+        self.assertNotIn("$schema", inline_schema)
+        self.assertNotIn("$comment", inline_schema)
+        self.assertEqual(inline_schema["type"], "object")
+        self.assertIn("workstreams", inline_schema["properties"])
+        self.assertIn("--forward-subagent-text", spec.argv)
+        self.assertNotIn("--dangerously-skip-permissions", spec.argv)
+        self.assertNotIn("--safe-mode", spec.argv)
+        agents = json.loads(spec.argv[spec.argv.index("--agents") + 1])
+        self.assertEqual(
+            set(agents),
+            {f"swarmerz-worker-{number:02d}" for number in range(1, 5)},
+        )
+        self.assertTrue(all(agent["omitClaudeMd"] for agent in agents.values()))
+        self.assertEqual(spec.env["CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS"], "1")
+
+    def test_claude_analyzer_runs_without_hunter_agents(self) -> None:
+        config, _engine = self._claude_engine()
+        analyzer = replace(
+            config.analyzer,
+            id="claude-analyzer",
+            harness="claude-code",
+            harness_version="2.1.328",
+            provider="anthropic",
+            model="claude-mythos-5-2",
+            model_snapshot=None,
+            reasoning_effort="xhigh",
+            supported_efforts=("low", "medium", "high", "xhigh", "max"),
+            command=(),
+            pass_env=(),
+        )
+        with TemporaryDirectory() as directory, mock.patch(
+            "swarmerz.orchestration.adapters.shutil.which",
+            return_value="/opt/bin/claude",
+        ):
+            root = Path(directory)
+            spec = build_analyzer_command(
+                config,
+                analyzer,
+                run_id="test",
+                workspace=root / "workspace",
+                artifact_dir=root / "output",
+                answers_path=root / "answers.json",
+                prompt="Judge the reports",
+            )
+        self.assertIn("--safe-mode", spec.argv)
+        self.assertNotIn("--agents", spec.argv)
+        self.assertNotIn("Agent", spec.argv[spec.argv.index("--tools") + 1].split(","))
+        self.assertEqual(spec.artifact_path, root / "output" / "analysis.json")
+
+    def test_claude_auth_probe_does_not_expose_or_modify_credentials(self) -> None:
+        config, engine = self._claude_engine()
+        with mock.patch(
+            "swarmerz.orchestration.adapters.shutil.which",
+            return_value="/opt/bin/claude",
+        ):
+            spec = build_auth_probe_command(
+                config, engine, run_id="test", cwd=PROJECT_ROOT
+            )
+        self.assertEqual(
+            spec.argv, ("/opt/bin/claude", "auth", "status", "--json")
+        )
+
+    def test_claude_stream_materializes_output_and_attests_worker_calls(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            stream = root / "stdout.jsonl"
+            events: list[dict[str, object]] = [
+                {"type": "system", "subtype": "init", "session_id": "session-1"},
+            ]
+            for number in range(1, 5):
+                tool_id = f"tool-{number}"
+                events.extend((
+                    {
+                        "type": "assistant",
+                        "session_id": "session-1",
+                        "parent_tool_use_id": None,
+                        "message": {"content": [{
+                            "type": "tool_use",
+                            "id": tool_id,
+                            "name": "Agent",
+                            "input": {
+                                "subagent_type": f"swarmerz-worker-{number:02d}",
+                                "description": f"workstream {number}",
+                            },
+                        }]},
+                    },
+                    {
+                        "type": "user",
+                        "session_id": "session-1",
+                        "message": {"content": [{
+                            "type": "tool_result",
+                            "tool_use_id": tool_id,
+                            "content": "done",
+                        }]},
+                    },
+                ))
+            events.append({
+                "type": "assistant",
+                "session_id": "session-1",
+                "parent_tool_use_id": "tool-1",
+                "message": {"content": [{
+                    "type": "tool_use",
+                    "id": "nested-agent-call",
+                    "name": "Agent",
+                    "input": {"subagent_type": "must-not-count"},
+                }]},
+            })
+            structured = {
+                "answer": "result",
+                "key_points": [],
+                "assumptions": [],
+                "uncertainties": [],
+                "sources": [],
+                "workstreams": [
+                    {"name": str(number), "scope": "scope", "conclusion": "done"}
+                    for number in range(1, 5)
+                ],
+                "confidence": 0.9,
+            }
+            events.append({
+                "type": "result",
+                "session_id": "session-1",
+                "is_error": False,
+                "structured_output": structured,
+            })
+            stream.write_text(
+                "\n".join(json.dumps(event) for event in events) + "\n",
+                encoding="utf-8",
+            )
+            answer = root / ".swarm" / "answer.json"
+            inspection = materialize_claude_output(stream, answer)
+            fanout = claude_fanout_evidence(stream, 4)
+
+            self.assertEqual(inspection["session_id"], "session-1")
+            self.assertEqual(json.loads(answer.read_text(encoding="utf-8")), structured)
+            self.assertTrue(fanout["verified"])
+            self.assertEqual(fanout["snapshot"]["terminal_workers"], 4)
+            self.assertTrue(fanout["snapshot"]["all_workers_terminal"])
+            self.assertEqual(len(inspect_claude_stream(stream)["calls"]), 4)
+
+    def test_claude_live_events_hide_thinking_and_show_agent_activity(self) -> None:
+        event = json.dumps({
+            "type": "assistant",
+            "parent_tool_use_id": None,
+            "message": {"content": [{
+                "type": "tool_use",
+                "name": "Agent",
+                "input": {"description": "inspect parser boundaries"},
+            }]},
+        })
+        self.assertEqual(
+            _live_event_summary("claude-code", "stdout", event),
+            "tool Agent (started): inspect parser boundaries",
+        )
+        thinking = json.dumps({
+            "type": "assistant",
+            "message": {"content": [{"type": "thinking", "thinking": "private"}]},
+        })
+        self.assertIsNone(_live_event_summary("claude-code", "stdout", thinking))
+
+    def test_claude_resume_keeps_contract_and_replaces_only_prompt(self) -> None:
+        spec = CommandSpec(
+            argv=("claude", "--print", "--json-schema", "{}", "initial"),
+            cwd=PROJECT_ROOT,
+            env={},
+            artifact_path=PROJECT_ROOT / "answer.json",
+        )
+        resumed = claude_resume_spec(spec, "session-1", "continue")
+        self.assertEqual(
+            resumed.argv,
+            (
+                "claude", "--print", "--json-schema", "{}",
+                "--resume", "session-1", "continue",
+            ),
+        )
+
     def test_pinned_codex_prefers_installed_executable(self) -> None:
         config = load_config(PROJECT_ROOT / "swarmerz.toml")
         engine = next(item for item in config.hunters if item.harness == "codex-exec")

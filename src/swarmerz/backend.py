@@ -152,7 +152,7 @@ class SwarmerzBackend:
         review_command = ""
         if (
             manifest.get("status") == "completed"
-            and config.analyzer.harness in {"codex", "codex-exec"}
+            and config.analyzer.harness in {"codex", "codex-exec", "claude-code"}
             and not config.analyzer.command
         ):
             self._review_argv = _review_hint_argv(
@@ -260,7 +260,7 @@ class HistoricalBackend:
         if (
             manifest.get("status") == "completed"
             and isinstance(analyzer, dict)
-            and analyzer.get("harness") in {"codex", "codex-exec"}
+            and analyzer.get("harness") in {"codex", "codex-exec", "claude-code"}
         ):
             self._review_argv = _review_hint_argv(
                 self.config_path, self.overrides, manifest

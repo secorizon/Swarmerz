@@ -196,6 +196,7 @@ def _engine_diagnostic(
         "opencode": "opencode",
         "codex": "codex",
         "codex-exec": "codex",
+        "claude-code": "claude",
         "cline": "cline",
     }.get(engine.harness)
     if executable_name is None:

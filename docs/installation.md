@@ -61,8 +61,25 @@ The package manager installs the two Python runtime dependencies:
 - `jsonschema` for structured artifact validation.
 
 Model harnesses are external tools selected by the deployment profile. Install only those required
-by the configuration. A pinned harness may be resolved through `npx` when Node.js/npm is installed;
-an already installed `codex` or `opencode` executable does not require `npx`.
+by the configuration. A pinned harness may be resolved through `npx` when Node.js/npm is installed.
+Installed `codex`, `claude`, and `opencode` executables are preferred and do not require `npx`; a
+missing pinned Claude Code version can resolve through `@anthropic-ai/claude-code` when `npx` is
+available.
+Startup probes installed native CLIs and treats the reported executable version as authoritative.
+A stale profile version therefore produces an informational setup event rather than aborting the
+round. The profile is not rewritten; the manifest records the configured and resolved versions
+plus their source under `runtime_harness_versions`. Exact mismatch enforcement remains in place
+when Swarmerz actually resolves a pinned package through `npx`.
+
+Authenticate only the native harnesses selected by the deployment profile:
+
+```bash
+claude auth login   # only for a native claude-code hunter or analyzer
+codex login         # only for a native Codex hunter or analyzer
+```
+
+Mission startup checks Claude Code authentication without making a model request. `doctor` checks
+that the executable or pinned fallback is available; it does not contact the account.
 
 Release artifacts do not contain a deployment profile. Obtain a template from the source repository,
 review every route and path, and pass the resulting file with `--config`.

@@ -70,8 +70,8 @@ def _remove_disposable_context_view(view: Path) -> None:
 
 def review_argv(config: object, run_dir: Path, *, resume: bool = False) -> list[str]:
     engine = config.analyzer
-    if engine.harness not in {"codex", "codex-exec"} or engine.command:
-        raise ConfigError("interactive review requires a native Codex analyzer")
+    if engine.harness not in {"codex", "codex-exec", "claude-code"} or engine.command:
+        raise ConfigError("interactive review requires a native Codex or Claude Code analyzer")
     workspace = run_dir / "workspaces" / "analyzer"
     private = workspace / ".swarm"
     private.mkdir(parents=True, exist_ok=True)
@@ -102,17 +102,37 @@ def review_argv(config: object, run_dir: Path, *, resume: bool = False) -> list[
             symlinks=True,
             copy_function=copy_independent_file,
         )
-    installed_codex = shutil.which("codex")
-    argv = [installed_codex] if installed_codex else _executable(engine)
-    if resume:
-        argv += ["resume", "--last"]
-    argv += [
-        "-C", str(workspace), "-m", engine.effective_model,
-        "-c", f'model_reasoning_effort="{engine.reasoning_effort}"',
-        "--sandbox", "read-only", "--disable", "apps",
-    ]
-    if not resume:
-        argv.append(_REVIEW_PROMPT)
+    if engine.harness == "claude-code":
+        installed_claude = shutil.which("claude")
+        argv = [installed_claude] if installed_claude else _executable(engine)
+        argv += [
+            "--restricted",
+            "--strict-mcp-config",
+            "--safe-mode",
+            "--no-chrome",
+            "--disable-slash-commands",
+            "--permission-mode", "plan",
+            "--tools", "Read,Grep,Glob",
+            "--allowedTools", "Read,Grep,Glob",
+            "--model", engine.effective_model,
+            "--effort", engine.reasoning_effort,
+        ]
+        if resume:
+            argv.append("--continue")
+        else:
+            argv.append(_REVIEW_PROMPT)
+    else:
+        installed_codex = shutil.which("codex")
+        argv = [installed_codex] if installed_codex else _executable(engine)
+        if resume:
+            argv += ["resume", "--last"]
+        argv += [
+            "-C", str(workspace), "-m", engine.effective_model,
+            "-c", f'model_reasoning_effort="{engine.reasoning_effort}"',
+            "--sandbox", "read-only", "--disable", "apps",
+        ]
+        if not resume:
+            argv.append(_REVIEW_PROMPT)
     return argv
 
 
@@ -165,7 +185,7 @@ def chat(
                 managed_environment(
                     config.storage,
                     review_run_id,
-                    "codex-review",
+                    f"{config.analyzer.harness}-review",
                 )
             )
             prepare_managed_environment(environment)

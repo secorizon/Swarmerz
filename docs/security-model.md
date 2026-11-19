@@ -91,8 +91,17 @@ Prefer authenticated harness sessions or pass only reviewed variable names throu
 Environment inheritance is disabled by default; literal `env` values can become part of operational
 state and should not contain credentials.
 
-An Ollama endpoint URL cannot contain embedded username/password data. Per-hunter OpenCode isolation
-uses private state roots and therefore does not silently reuse the user's global OpenCode auth store.
+Native Claude Code reads its existing authenticated account state through the normal minimal
+`HOME` environment. Swarmerz neither copies nor modifies that state. Its authentication probe is
+sanitized before storage so email and organization metadata do not enter the run artifacts.
+Restricted mode confines Claude's built-in file tools to the staged working directory and disables
+unconfigured MCP discovery, but Swarmerz explicitly enables Bash for source inspection, builds,
+and reproductions. That shell remains a same-user process and is not a hostile-code sandbox.
+
+An Ollama endpoint URL cannot contain embedded username/password data, a query, or a fragment.
+Catalog discovery bypasses shell proxy settings, applies a short timeout, and caps the response at
+4 MiB; the endpoint still receives the operator machine's direct network connection. Per-hunter
+OpenCode isolation uses private state roots and therefore does not silently reuse the user's global OpenCode auth store.
 For hosted providers, Swarmerz queries the private server's integration metadata and forwards only
 the provider-declared variables that are present in the launch environment. It does not read or copy
 the global OpenCode database. The temporary private HOME and database are removed when the hunter

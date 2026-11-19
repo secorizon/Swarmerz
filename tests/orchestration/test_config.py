@@ -16,7 +16,10 @@ from unittest import mock
 from swarmerz.orchestration.config import load_config
 from swarmerz.orchestration.local_context import instruction_for_workspace
 from swarmerz.orchestration.models import ConfigError
-from swarmerz.orchestration.ollama_probe import probe_ollama_model
+from swarmerz.orchestration.ollama_probe import (
+    list_ollama_models,
+    probe_ollama_model,
+)
 from swarmerz.orchestration.runner import AuditRunner, _hunter_progress_name, _validate_context_tree
 
 
@@ -227,6 +230,29 @@ class ConfigTests(unittest.TestCase):
                 with self.assertRaisesRegex(ConfigError, "completion and tools"):
                     probe_ollama_model(engine)
 
+    def test_remote_ollama_catalog_accepts_a_bare_lan_host(self) -> None:
+        inventory = json.dumps({
+            "models": [
+                {"name": "qwen3:32b", "model": "qwen3:32b"},
+                {"name": "granite-code:latest"},
+            ]
+        }).encode()
+        opener = mock.Mock()
+        opener.open.return_value = io.BytesIO(inventory)
+        with mock.patch(
+            "swarmerz.orchestration.ollama_probe.build_opener",
+            return_value=opener,
+        ):
+            base_url, inventory_url, models = list_ollama_models("192.168.8.167")
+
+        self.assertEqual(base_url, "http://192.168.8.167:11434/v1")
+        self.assertEqual(inventory_url, "http://192.168.8.167:11434/api/tags")
+        self.assertEqual(models, ("granite-code:latest", "qwen3:32b"))
+        self.assertEqual(
+            opener.open.call_args.args[0].full_url,
+            "http://192.168.8.167:11434/api/tags",
+        )
+
     def _write(self, root: Path, effort: str = "low", hunter_count: int = 4) -> Path:
         hunters = []
         for index in range(hunter_count):
@@ -290,6 +316,69 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.storage.max_cache_age_days, 30)
             self.assertEqual(config.storage.failed_scratch_retention_days, 7)
             self.assertTrue(config.storage.cleanup_successful_workspaces)
+
+    def test_claude_code_has_native_efforts_for_hunters_and_analyzers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = self._write(root, hunter_count=2)
+            content = path.read_text(encoding="utf-8")
+            content = content.replace('harness = "command"', 'harness = "claude-code"', 1)
+            content = content.replace('provider = "test"', 'provider = "anthropic"', 1)
+            content = content.replace('model = "model-0"', 'model = "claude-mythos-5-2"', 1)
+            content = content.replace('reasoning_effort = "low"', 'reasoning_effort = "xhigh"', 1)
+            content = content.replace('supported_efforts = ["low", "medium"]\n', "", 1)
+            content = content.replace('command = ["true"]\n', "", 1)
+            path.write_text(content, encoding="utf-8")
+            config = load_config(path)
+            self.assertEqual(config.hunters[0].harness, "claude-code")
+            self.assertEqual(
+                config.hunters[0].supported_efforts,
+                ("low", "medium", "high", "xhigh", "max"),
+            )
+
+            content = path.read_text(encoding="utf-8")
+            prefix, analyzer = content.split("[analyzer]", 1)
+            analyzer = analyzer.replace(
+                'harness = "codex-exec"', 'harness = "claude-code"', 1
+            )
+            analyzer = analyzer.replace('provider = "openai"', 'provider = "anthropic"', 1)
+            analyzer = analyzer.replace('model = "codex-test"', 'model = "claude-mythos-5-2"', 1)
+            analyzer = analyzer.replace('reasoning_effort = "medium"', 'reasoning_effort = "max"', 1)
+            analyzer = analyzer.replace('supported_efforts = ["medium"]\n', "", 1)
+            analyzer = analyzer.replace('command = ["true"]\n', "", 1)
+            path.write_text(prefix + "[analyzer]" + analyzer, encoding="utf-8")
+            config = load_config(path)
+            self.assertEqual(config.analyzer.harness, "claude-code")
+            self.assertEqual(config.analyzer.reasoning_effort, "max")
+
+    def test_claude_code_rejects_unsupported_efforts_and_protocol_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = self._write(root, hunter_count=2)
+            content = path.read_text(encoding="utf-8")
+            content = content.replace('harness = "command"', 'harness = "claude-code"', 1)
+            content = content.replace('provider = "test"', 'provider = "anthropic"', 1)
+            content = content.replace('model = "model-0"', 'model = "claude-test"', 1)
+            content = content.replace('reasoning_effort = "low"', 'reasoning_effort = "default"', 1)
+            content = content.replace(
+                'supported_efforts = ["low", "medium"]',
+                'supported_efforts = ["default"]',
+                1,
+            )
+            content = content.replace('command = ["true"]\n', "", 1)
+            path.write_text(content, encoding="utf-8")
+            with self.assertRaisesRegex(ConfigError, "Claude Code CLI cannot select"):
+                load_config(path)
+
+            content = content.replace('reasoning_effort = "default"', 'reasoning_effort = "high"', 1)
+            content = content.replace(
+                'supported_efforts = ["default"]',
+                'supported_efforts = ["high"]\nextra_args = ["--tools=Bash,WebFetch"]',
+                1,
+            )
+            path.write_text(content, encoding="utf-8")
+            with self.assertRaisesRegex(ConfigError, "cannot override Claude Code protocol"):
+                load_config(path)
 
     def test_opencode_server_mode_defaults_shared_and_validates_opt_in(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

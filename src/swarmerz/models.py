@@ -14,7 +14,11 @@ from pathlib import Path
 def display_model_name(model: str) -> str:
     """Return a compact operator-facing model name without changing its ID."""
     leaf = model.rsplit("/", 1)[-1]
-    return "daybreak" if "daybreak" in leaf.lower() else leaf
+    if "daybreak" in leaf.lower():
+        return "daybreak"
+    if leaf.lower().startswith("claude-"):
+        return leaf[len("claude-") :]
+    return leaf
 
 
 class MissionPhase(StrEnum):
@@ -63,7 +67,7 @@ class HunterSpec:
     def label(self) -> str:
         if self.provider == "ollama":
             return self.model
-        if self.harness in {"codex", "codex-exec"}:
+        if self.harness in {"codex", "codex-exec", "claude-code"}:
             return display_model_name(self.model)
         return self.id
 

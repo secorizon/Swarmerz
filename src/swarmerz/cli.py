@@ -26,6 +26,12 @@ from .doctor import (
     print_diagnostics,
 )
 from .launchpad import LaunchpadApp
+from .model_configurator import ModelConfiguratorApp
+from .model_inventory import (
+    apply_model_configuration,
+    collect_model_inventory,
+    print_model_inventory,
+)
 from .models import HunterSpec, MissionState
 from .orchestration.artifacts import read_json
 from .orchestration.config import load_config
@@ -68,7 +74,7 @@ def _parser() -> argparse.ArgumentParser:
     analyze.add_argument("--json", action="store_true", dest="headless_json")
 
     chat = subparsers.add_parser(
-        "chat", help="open a follow-up when the primary analyzer is native Codex"
+        "chat", help="open a follow-up when the primary analyzer is native Codex or Claude Code"
     )
     _core_options(chat, instruction=False)
     chat.add_argument("--session", required=True)
@@ -88,6 +94,23 @@ def _parser() -> argparse.ArgumentParser:
     )
     _core_options(doctor, instruction=False)
     doctor.add_argument("--json", action="store_true", dest="json_output")
+
+    models = subparsers.add_parser(
+        "models",
+        help="show redacted configured routes and available harness models",
+    )
+    _core_options(models, instruction=False)
+    models.add_argument("--json", action="store_true", dest="json_output")
+
+    config_models = subparsers.add_parser(
+        "config-models",
+        help="interactively check hunters and choose a primary judge",
+    )
+    config_models.add_argument(
+        "--config",
+        type=Path,
+        help="configuration file (default: ./swarmerz.toml)",
+    )
 
     demo = subparsers.add_parser("demo", help="experience the deck without launching models")
     demo.add_argument("--speed", type=float, default=0.22, help="demo pacing multiplier")
@@ -135,7 +158,7 @@ def _demo_specs() -> tuple[HunterSpec, ...]:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if (
-        args.command not in {"chat", "cache", "doctor"}
+        args.command not in {"chat", "cache", "doctor", "models"}
         and not getattr(args, "headless", False)
         and (not sys.stdin.isatty() or not sys.stdout.isatty())
     ):
@@ -152,6 +175,46 @@ def main(argv: list[str] | None = None) -> int:
             checks = collect_diagnostics(config)
             print_diagnostics(checks, json_output=args.json_output)
             return diagnostics_exit_code(checks)
+        if args.command == "models":
+            config_path = _resolve_config_path(args.config)
+            config = load_config(str(config_path), args.overrides)
+            inventory = collect_model_inventory(config)
+            print_model_inventory(inventory, json_output=args.json_output)
+            return 0
+        if args.command == "config-models":
+            config_path = _resolve_config_path(args.config)
+            config = load_config(str(config_path))
+            print(
+                "swarmerz: discovering configured providers and native model catalogs...",
+                file=sys.stderr,
+                flush=True,
+            )
+            inventory = collect_model_inventory(config)
+            request = asyncio.run(ModelConfiguratorApp(config, inventory).run())
+            if request is None:
+                print("swarmerz: model configuration cancelled; profile unchanged")
+                return 0
+            change = apply_model_configuration(
+                config,
+                inventory,
+                request.hunter_selectors,
+                judge_selector=request.judge_selector,
+                judge_changed=request.judge_changed,
+                workers=request.workers,
+            )
+            if not change["changed"]:
+                print("swarmerz: no model configuration changes were selected")
+                return 0
+            judge = change.get("judge")
+            judge_note = (
+                f", judge={judge['selector']}" if isinstance(judge, dict) else ""
+            )
+            print(
+                f"swarmerz: updated {change['config_path']} "
+                f"({len(change['added'])} added, {len(change['removed'])} removed"
+                f"{judge_note}; {change['hunter_count']} hunters)"
+            )
+            return 0
         if args.command in {"run", "analyze"} and getattr(args, "headless", False):
             return asyncio.run(_run_headless(args))
         if getattr(args, "headless_json", False):

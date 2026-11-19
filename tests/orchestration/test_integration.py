@@ -33,6 +33,374 @@ from swarmerz.review import chat
 
 
 class IntegrationTests(unittest.TestCase):
+    def test_native_claude_hunters_complete_with_observed_agent_fanout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_claude = root / "claude"
+            fake_claude.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!{sys.executable}
+                    import json, os, sys
+
+                    args = sys.argv[1:]
+                    if "--version" in args:
+                        print("2.1.328 (Claude Code)")
+                        raise SystemExit(0)
+                    if args[:2] == ["auth", "status"]:
+                        print(json.dumps({{
+                            "loggedIn": True,
+                            "authMethod": "claude.ai",
+                            "apiProvider": "firstParty",
+                            "email": "must-not-survive@example.invalid",
+                            "orgName": "must not survive",
+                        }}))
+                        raise SystemExit(0)
+
+                    schema = json.loads(args[args.index("--json-schema") + 1])
+                    assert "$schema" not in schema
+                    assert "$comment" not in schema
+                    agents = json.loads(args[args.index("--agents") + 1])
+                    session_id = "session-" + os.environ["SWARM_ROLE_ID"]
+                    print(json.dumps({{
+                        "type": "system", "subtype": "init", "session_id": session_id,
+                    }}), flush=True)
+                    workstreams = []
+                    for number, name in enumerate(agents, 1):
+                        tool_id = f"tool-{{number}}"
+                        print(json.dumps({{
+                            "type": "assistant", "session_id": session_id,
+                            "parent_tool_use_id": None,
+                            "message": {{"content": [{{
+                                "type": "tool_use", "id": tool_id, "name": "Agent",
+                                "input": {{
+                                    "subagent_type": name,
+                                    "description": f"workstream {{number}}",
+                                }},
+                            }}]}},
+                        }}), flush=True)
+                        print(json.dumps({{
+                            "type": "user", "session_id": session_id,
+                            "message": {{"content": [{{
+                                "type": "tool_result", "tool_use_id": tool_id,
+                                "content": "completed",
+                            }}]}},
+                        }}), flush=True)
+                        workstreams.append({{
+                            "name": name,
+                            "scope": f"scope {{number}}",
+                            "conclusion": "completed",
+                        }})
+                    answer = {{
+                        "answer": "native Claude answer",
+                        "key_points": ["structured"],
+                        "assumptions": [],
+                        "uncertainties": [],
+                        "sources": [],
+                        "workstreams": workstreams,
+                        "confidence": 0.8,
+                    }}
+                    print(json.dumps({{
+                        "type": "result", "session_id": session_id,
+                        "is_error": False, "structured_output": answer,
+                    }}), flush=True)
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_claude.chmod(0o755)
+            analyzer_script = root / "analyzer.py"
+            analyzer_script.write_text(
+                textwrap.dedent(
+                    """
+                    import json, pathlib, sys
+                    bundle = json.loads(pathlib.Path(sys.argv[1]).read_text())
+                    labels = [item["answer_id"] for item in bundle["answers"]]
+                    pathlib.Path(sys.argv[2]).write_text(json.dumps({
+                        "summary": "reviewed Claude answers",
+                        "agreement": [],
+                        "disagreements": [],
+                        "answer_assessments": [
+                            {"answer_id": label, "strengths": [], "weaknesses": [], "factual_risks": []}
+                            for label in labels
+                        ],
+                        "validated_findings": [],
+                        "unresolved_questions": [],
+                        "recommended_answer": "Claude fleet synthesis",
+                        "confidence": 0.8
+                    }))
+                    """
+                ),
+                encoding="utf-8",
+            )
+            hunters = "".join(
+                textwrap.dedent(
+                    f"""
+                    [[hunters]]
+                    id = "{hunter_id}"
+                    harness = "claude-code"
+                    harness_version = "2.1.328"
+                    provider = "anthropic"
+                    model = "claude-mythos-5-2"
+                    reasoning_effort = "xhigh"
+                    workers = 2
+                    """
+                )
+                for hunter_id in ("claude-a", "claude-b")
+            )
+            config_path = root / "swarm.toml"
+            config_path.write_text(
+                textwrap.dedent(
+                    f"""
+                    schema_version = 1
+                    output_root = "{root / 'runs'}"
+                    max_parallel_hunters = 2
+                    minimum_answers = 2
+
+                    [storage]
+                    cache_root = "{root / 'cache'}"
+
+                    [resources]
+                    mode = "off"
+
+                    {hunters}
+
+                    [analyzer]
+                    id = "judge"
+                    harness = "command"
+                    harness_version = "1"
+                    provider = "test"
+                    model = "judge"
+                    reasoning_effort = "high"
+                    supported_efforts = ["high"]
+                    command = ["{sys.executable}", "{analyzer_script}", "{{answers}}", "{{result}}"]
+                    """
+                ),
+                encoding="utf-8",
+            )
+            path = f"{root}{os.pathsep}{os.environ.get('PATH', '')}"
+            with mock.patch.dict(os.environ, {"PATH": path}):
+                run_dir = asyncio.run(AuditRunner(
+                    load_config(config_path),
+                    "review the target",
+                    session_id="native-claude",
+                    round_id="first",
+                ).run())
+
+            manifest = json.loads((run_dir / "manifest.json").read_text())
+            self.assertEqual(manifest["status"], "completed")
+            for hunter_id in ("claude-a", "claude-b"):
+                result = json.loads(
+                    (run_dir / "hunters" / hunter_id / "result.json").read_text()
+                )
+                self.assertTrue(result["answer_sealed"])
+                self.assertTrue(result["worker_contract_verified"])
+                self.assertEqual(result["fanout_evidence"], "observed_claude_agent_calls")
+                self.assertEqual(result["worker_completion"]["terminal"], 2)
+                auth = json.loads(
+                    (run_dir / "setup" / f"{hunter_id}-auth" / "stdout.json").read_text()
+                )
+                self.assertEqual(set(auth), {"loggedIn", "authMethod", "apiProvider"})
+            self.assertEqual(
+                json.loads((run_dir / "final" / "analysis.json").read_text())[
+                    "recommended_answer"
+                ],
+                "Claude fleet synthesis",
+            )
+
+    def test_claude_auth_probe_discards_identifying_account_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            engine = SimpleNamespace(
+                id="claude",
+                harness="claude-code",
+                harness_version="2.1.328",
+                provider="anthropic",
+                command=(),
+            )
+            analyzer = SimpleNamespace(
+                id="judge",
+                harness="command",
+                harness_version="1",
+                provider="test",
+                command=("true",),
+            )
+            runner = object.__new__(AuditRunner)
+            runner.config = SimpleNamespace(
+                hunters=(engine,),
+                analyzer=analyzer,
+                secondary_analyzer=None,
+                isolation=SimpleNamespace(opencode_server_mode="shared"),
+            )
+            runner.run_dir = root
+            runner.session_id = "session"
+            runner.round_id = "round"
+            runner.progress = None
+
+            async def execute(_spec: CommandSpec, **kwargs: object) -> dict[str, object]:
+                Path(str(kwargs["stdout_path"])).parent.mkdir(parents=True, exist_ok=True)
+                Path(str(kwargs["stdout_path"])).write_text(json.dumps({
+                    "loggedIn": True,
+                    "authMethod": "claude.ai",
+                    "apiProvider": "firstParty",
+                    "email": "operator@example.invalid",
+                    "orgId": "organization-secret-metadata",
+                    "orgName": "Sensitive Team Name",
+                }), encoding="utf-8")
+                Path(str(kwargs["stderr_path"])).write_text("", encoding="utf-8")
+                return {
+                    "status": "completed",
+                    "exit_code": 0,
+                    "timed_out": False,
+                    "duration_seconds": 0,
+                }
+
+            auth_spec = CommandSpec(
+                argv=("claude", "auth", "status", "--json"),
+                cwd=root,
+                env={},
+                artifact_path=None,
+            )
+            with mock.patch.object(
+                runner, "_check_chatgpt_codex_models", return_value=[]
+            ), mock.patch.object(
+                runner, "_build_probe_command", return_value=None
+            ), mock.patch.object(
+                runner, "_build_auth_probe_command", return_value=auth_spec
+            ), mock.patch.object(
+                runner, "_execute_command", side_effect=execute
+            ):
+                asyncio.run(runner._prepare_harnesses())
+
+            stored = json.loads(
+                (root / "setup" / "claude-auth" / "stdout.json").read_text()
+            )
+            self.assertEqual(stored, {
+                "apiProvider": "firstParty",
+                "authMethod": "claude.ai",
+                "loggedIn": True,
+            })
+
+    def test_installed_native_harness_version_replaces_a_stale_profile_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "swarm.toml"
+            config_path.write_text(textwrap.dedent(f"""
+                schema_version = 1
+                output_root = "{root / 'runs'}"
+                minimum_answers = 2
+
+                [[hunters]]
+                id = "one"
+                harness = "command"
+                harness_version = "1"
+                provider = "test"
+                model = "one"
+                reasoning_effort = "low"
+                supported_efforts = ["low"]
+                command = ["true"]
+                workers = 2
+
+                [[hunters]]
+                id = "two"
+                harness = "command"
+                harness_version = "1"
+                provider = "test"
+                model = "two"
+                reasoning_effort = "low"
+                supported_efforts = ["low"]
+                command = ["true"]
+                workers = 2
+
+                [analyzer]
+                id = "codex-analyzer"
+                harness = "codex-exec"
+                harness_version = "0.169.0"
+                provider = "openai"
+                model = "gpt-test"
+                reasoning_effort = "high"
+                supported_efforts = ["high"]
+            """), encoding="utf-8")
+            runner = object.__new__(AuditRunner)
+            runner.config = load_config(config_path)
+            runner.run_dir = root
+            runner.session_id = "session"
+            runner.round_id = "round"
+            messages: list[str] = []
+            runner.progress = messages.append
+            runner.manifest = {"status": "setup"}
+            probe = CommandSpec(
+                argv=("/opt/bin/codex", "--version"),
+                cwd=root,
+                env={},
+                artifact_path=None,
+            )
+
+            async def execute(_spec: CommandSpec, **kwargs: object) -> dict[str, object]:
+                stdout = Path(str(kwargs["stdout_path"]))
+                stderr = Path(str(kwargs["stderr_path"]))
+                stdout.parent.mkdir(parents=True, exist_ok=True)
+                stdout.write_text("codex-cli 0.170.0\n", encoding="utf-8")
+                stderr.write_text("", encoding="utf-8")
+                return {"status": "completed", "exit_code": 0}
+
+            def build_probe(_config, engine, **_kwargs):
+                return None if engine.command else probe
+
+            with mock.patch.object(
+                runner, "_check_chatgpt_codex_models", return_value=[]
+            ), mock.patch.object(
+                runner, "_build_probe_command", side_effect=build_probe
+            ), mock.patch.object(
+                runner, "_execute_command", side_effect=execute
+            ):
+                asyncio.run(runner._prepare_harnesses())
+
+            self.assertEqual(runner.config.analyzer.harness_version, "0.170.0")
+            self.assertEqual(
+                runner.manifest["runtime_harness_versions"]["codex-analyzer"],
+                {
+                    "configured": "0.169.0",
+                    "resolved": "0.170.0",
+                    "source": "installed",
+                },
+            )
+            self.assertEqual(runner.manifest["analyzer"]["harness_version"], "0.170.0")
+            self.assertTrue(any(
+                "configured 0.169.0; using installed 0.170.0" in message
+                for message in messages
+            ))
+
+            pinned_runner = object.__new__(AuditRunner)
+            pinned_runner.config = load_config(config_path)
+            pinned_runner.run_dir = root / "pinned"
+            pinned_runner.run_dir.mkdir()
+            pinned_runner.session_id = "session"
+            pinned_runner.round_id = "round"
+            pinned_runner.progress = None
+            pinned_runner.manifest = {}
+            pinned_probe = CommandSpec(
+                argv=(
+                    "/usr/bin/npx", "--yes", "@openai/codex@0.169.0",
+                    "--version",
+                ),
+                cwd=root,
+                env={},
+                artifact_path=None,
+            )
+
+            def build_pinned_probe(_config, engine, **_kwargs):
+                return None if engine.command else pinned_probe
+
+            with mock.patch.object(
+                pinned_runner, "_check_chatgpt_codex_models", return_value=[]
+            ), mock.patch.object(
+                pinned_runner, "_build_probe_command", side_effect=build_pinned_probe
+            ), mock.patch.object(
+                pinned_runner, "_execute_command", side_effect=execute
+            ), self.assertRaisesRegex(ConfigError, "version mismatch"):
+                asyncio.run(pinned_runner._prepare_harnesses())
+
     def test_hunter_mutation_cannot_taint_peer_snapshot_or_blind_judge(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1211,6 +1579,37 @@ class IntegrationTests(unittest.TestCase):
                 Path(launched_environment["TMPDIR"]).is_relative_to(root / "cache")
             )
             self.assertFalse(Path(launched_environment["TMPDIR"]).exists())
+
+            config.analyzer = SimpleNamespace(
+                harness="claude-code",
+                command=(),
+                harness_version="2.1.328",
+                effective_model="claude-mythos-5-2",
+                reasoning_effort="xhigh",
+            )
+            output = io.StringIO()
+            with mock.patch(
+                "swarmerz.review.shutil.which", return_value="/opt/bin/claude"
+            ), contextlib.redirect_stdout(output):
+                self.assertEqual(
+                    chat(config, "review", "first", resume=False, print_command=True), 0
+                )
+            claude_command = output.getvalue()
+            self.assertTrue(claude_command.startswith("/opt/bin/claude "))
+            self.assertIn("--restricted", claude_command)
+            self.assertIn("--safe-mode", claude_command)
+            self.assertIn("claude-mythos-5-2", claude_command)
+            self.assertIn("Do not print raw JSON", claude_command)
+
+            output = io.StringIO()
+            with mock.patch(
+                "swarmerz.review.shutil.which", return_value="/opt/bin/claude"
+            ), contextlib.redirect_stdout(output):
+                self.assertEqual(
+                    chat(config, "review", "first", resume=True, print_command=True), 0
+                )
+            self.assertIn("--continue", output.getvalue())
+            self.assertNotIn("Do not print raw JSON", output.getvalue())
 
     def test_failed_analysis_retries_sealed_answers_without_rerunning_hunters(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

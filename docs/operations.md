@@ -154,6 +154,16 @@ Inspect the signal rail, `worker-monitor.json`, harness stderr, and any unresolv
 request. Swarmerz rejects unattended OpenCode permission escalation rather than silently granting
 access. Use `/wrap ID` to request consolidation if useful partial work exists.
 
+A native Claude Code print turn cannot accept an instruction while it is active. If it fails after
+establishing a session while another hunter is still running, Swarmerz marks it `RECOVERABLE`; use
+`/to ID MESSAGE` to resume that exact session. The same targeted recovery rule applies to failed
+native Codex turns and verified native OpenCode sessions.
+
+If a configured native harness version differs from an installed Codex, Claude Code, or OpenCode
+CLI, startup uses the installed version and reports the reconciliation as an informational event.
+The profile remains unchanged. Inspect `manifest.json` → `runtime_harness_versions` for the
+configured value, resolved value, and resolution source used by each engine.
+
 ### Harness hit a resource ceiling
 
 Read `manifest.json` → `resource_limits`, the affected harness `result.json`, its stderr, and the

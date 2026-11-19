@@ -96,6 +96,22 @@ def test_codex_hunter_is_displayed_by_model_name_not_harness_id() -> None:
     assert app.state.hunters["codex"].spec.label == "daybreak"
 
 
+def test_claude_code_hunter_is_displayed_by_model_name_not_harness_id() -> None:
+    app = object.__new__(SwarmerzApp)
+    app.state = MissionState(
+        "test", "wait", (
+            HunterSpec(
+                "claude", "anthropic", "claude-mythos-5-2", "xhigh", 4,
+                "claude-code",
+            ),
+        )
+    )
+
+    fleet = fragment_list_to_text(app._render_fleet())
+    assert "MYTHOS-5-2" in fleet
+    assert app.state.hunters["claude"].spec.label == "mythos-5-2"
+
+
 def test_workspace_mouse_wheel_routes_to_virtual_viewport() -> None:
     motion: list[int] = []
     window = _WorkspaceWindow(
