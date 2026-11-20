@@ -182,6 +182,7 @@ class AdapterTests(unittest.TestCase):
             ]
             for number in range(1, 5):
                 tool_id = f"tool-{number}"
+                task_id = f"task-{number}"
                 events.extend((
                     {
                         "type": "assistant",
@@ -198,13 +199,31 @@ class AdapterTests(unittest.TestCase):
                         }]},
                     },
                     {
+                        "type": "system",
+                        "subtype": "task_started",
+                        "task_id": task_id,
+                        "tool_use_id": tool_id,
+                    },
+                    {
                         "type": "user",
                         "session_id": "session-1",
+                        "tool_use_result": {
+                            "isAsync": True,
+                            "status": "async_launched",
+                            "agentId": task_id,
+                        },
                         "message": {"content": [{
                             "type": "tool_result",
                             "tool_use_id": tool_id,
-                            "content": "done",
+                            "content": "Async agent launched successfully.",
                         }]},
+                    },
+                    {
+                        "type": "system",
+                        "subtype": "task_notification",
+                        "task_id": task_id,
+                        "tool_use_id": tool_id,
+                        "status": "completed",
                     },
                 ))
             events.append({
@@ -236,6 +255,16 @@ class AdapterTests(unittest.TestCase):
                 "is_error": False,
                 "structured_output": structured,
             })
+            events.append({
+                "type": "result",
+                "session_id": "session-1",
+                "origin": {
+                    "kind": "task-notification",
+                    "producer": "session-task",
+                },
+                "is_error": True,
+                "result": "background notification turn failed",
+            })
             stream.write_text(
                 "\n".join(json.dumps(event) for event in events) + "\n",
                 encoding="utf-8",
@@ -245,11 +274,103 @@ class AdapterTests(unittest.TestCase):
             fanout = claude_fanout_evidence(stream, 4)
 
             self.assertEqual(inspection["session_id"], "session-1")
+            self.assertTrue(inspection["structured_output_ready"])
             self.assertEqual(json.loads(answer.read_text(encoding="utf-8")), structured)
             self.assertTrue(fanout["verified"])
             self.assertEqual(fanout["snapshot"]["terminal_workers"], 4)
             self.assertTrue(fanout["snapshot"]["all_workers_terminal"])
+            self.assertEqual(fanout["snapshot"]["outcomes"]["succeeded"], 4)
             self.assertEqual(len(inspect_claude_stream(stream)["calls"]), 4)
+
+    def test_claude_async_launch_ack_is_not_completion_and_failed_turn_is_provisional(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            stream = root / "stdout.jsonl"
+            events: list[dict[str, object]] = [
+                {"type": "system", "subtype": "init", "session_id": "session-1"},
+            ]
+            terminal_events: list[dict[str, object]] = []
+            for number in range(1, 5):
+                tool_id = f"tool-{number}"
+                task_id = f"task-{number}"
+                events.extend((
+                    {
+                        "type": "assistant",
+                        "session_id": "session-1",
+                        "parent_tool_use_id": None,
+                        "message": {"content": [{
+                            "type": "tool_use",
+                            "id": tool_id,
+                            "name": "Agent",
+                            "input": {
+                                "subagent_type": f"swarmerz-worker-{number:02d}",
+                                "description": f"workstream {number}",
+                            },
+                        }]},
+                    },
+                    {
+                        "type": "system",
+                        "subtype": "task_started",
+                        "task_id": task_id,
+                        "tool_use_id": tool_id,
+                    },
+                    {
+                        "type": "user",
+                        "session_id": "session-1",
+                        "tool_use_result": {
+                            "isAsync": True,
+                            "status": "async_launched",
+                            "agentId": task_id,
+                        },
+                        "message": {"content": [{
+                            "type": "tool_result",
+                            "tool_use_id": tool_id,
+                            "content": "Async agent launched successfully.",
+                        }]},
+                    },
+                ))
+                terminal_events.append({
+                    "type": "system",
+                    "subtype": "task_notification",
+                    "task_id": task_id,
+                    "tool_use_id": tool_id,
+                    "status": "failed",
+                    "summary": "usage limit reached",
+                })
+            stream.write_text(
+                "\n".join(json.dumps(event) for event in events) + "\n",
+                encoding="utf-8",
+            )
+
+            launched = claude_fanout_evidence(stream, 4)
+            self.assertTrue(launched["verified"])
+            self.assertEqual(launched["snapshot"]["terminal_workers"], 0)
+            self.assertFalse(launched["snapshot"]["all_workers_terminal"])
+
+            with stream.open("a", encoding="utf-8") as handle:
+                for event in terminal_events:
+                    handle.write(json.dumps(event) + "\n")
+                handle.write(json.dumps({
+                    "type": "result",
+                    "session_id": "session-1",
+                    "is_error": True,
+                    "result": "usage limit reached",
+                }) + "\n")
+            answer = root / ".swarm" / "answer.json"
+            answer.parent.mkdir()
+            provisional = {"answer": "PRELIMINARY (workers still running)"}
+            answer.write_text(json.dumps(provisional), encoding="utf-8")
+
+            inspection = materialize_claude_output(stream, answer)
+            fanout = claude_fanout_evidence(stream, 4)
+            self.assertFalse(inspection["structured_output_ready"])
+            self.assertEqual(inspection["result_error"], "usage limit reached")
+            self.assertEqual(json.loads(answer.read_text(encoding="utf-8")), provisional)
+            self.assertEqual(fanout["snapshot"]["terminal_workers"], 4)
+            self.assertEqual(fanout["snapshot"]["outcomes"]["failed"], 4)
+            self.assertTrue(fanout["snapshot"]["all_workers_terminal"])
 
     def test_claude_live_events_hide_thinking_and_show_agent_activity(self) -> None:
         event = json.dumps({

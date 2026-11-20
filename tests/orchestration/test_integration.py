@@ -189,6 +189,7 @@ class IntegrationTests(unittest.TestCase):
 
             manifest = json.loads((run_dir / "manifest.json").read_text())
             self.assertEqual(manifest["status"], "completed")
+            self.assertFalse(manifest["degraded"])
             for hunter_id in ("claude-a", "claude-b"):
                 result = json.loads(
                     (run_dir / "hunters" / hunter_id / "result.json").read_text()
@@ -197,6 +198,10 @@ class IntegrationTests(unittest.TestCase):
                 self.assertTrue(result["worker_contract_verified"])
                 self.assertEqual(result["fanout_evidence"], "observed_claude_agent_calls")
                 self.assertEqual(result["worker_completion"]["terminal"], 2)
+                self.assertTrue(result["worker_completion"]["complete"])
+                self.assertEqual(
+                    result["worker_monitor"]["reason"], "all_workers_terminal"
+                )
                 auth = json.loads(
                     (run_dir / "setup" / f"{hunter_id}-auth" / "stdout.json").read_text()
                 )
@@ -206,6 +211,211 @@ class IntegrationTests(unittest.TestCase):
                     "recommended_answer"
                 ],
                 "Claude fleet synthesis",
+            )
+
+    def test_native_claude_quota_failure_does_not_seal_preliminary_answer(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_claude = root / "claude"
+            fake_claude.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!{sys.executable}
+                    import json, os, pathlib, sys
+
+                    args = sys.argv[1:]
+                    if "--version" in args:
+                        print("2.1.328 (Claude Code)")
+                        raise SystemExit(0)
+                    if args[:2] == ["auth", "status"]:
+                        print(json.dumps({{
+                            "loggedIn": True,
+                            "authMethod": "claude.ai",
+                            "apiProvider": "firstParty",
+                        }}))
+                        raise SystemExit(0)
+
+                    role = os.environ["SWARM_ROLE_ID"]
+                    failed = role == "claude-failed"
+                    agents = json.loads(args[args.index("--agents") + 1])
+                    session_id = "session-" + role
+                    print(json.dumps({{
+                        "type": "system", "subtype": "init", "session_id": session_id,
+                    }}), flush=True)
+                    workstreams = []
+                    for number, name in enumerate(agents, 1):
+                        tool_id = f"tool-{{number}}"
+                        task_id = f"task-{{number}}"
+                        print(json.dumps({{
+                            "type": "assistant", "session_id": session_id,
+                            "parent_tool_use_id": None,
+                            "message": {{"content": [{{
+                                "type": "tool_use", "id": tool_id, "name": "Agent",
+                                "input": {{"subagent_type": name}},
+                            }}]}},
+                        }}), flush=True)
+                        print(json.dumps({{
+                            "type": "system", "subtype": "task_started",
+                            "task_id": task_id, "tool_use_id": tool_id,
+                        }}), flush=True)
+                        print(json.dumps({{
+                            "type": "user", "session_id": session_id,
+                            "tool_use_result": {{
+                                "isAsync": True, "status": "async_launched",
+                                "agentId": task_id,
+                            }},
+                            "message": {{"content": [{{
+                                "type": "tool_result", "tool_use_id": tool_id,
+                                "content": "Async agent launched successfully.",
+                            }}]}},
+                        }}), flush=True)
+                        print(json.dumps({{
+                            "type": "system", "subtype": "task_notification",
+                            "task_id": task_id, "tool_use_id": tool_id,
+                            "status": "failed" if failed else "completed",
+                            "summary": "usage limit reached" if failed else "complete",
+                        }}), flush=True)
+                        workstreams.append({{
+                            "name": name,
+                            "scope": f"scope {{number}}",
+                            "conclusion": "pending" if failed else "completed",
+                        }})
+
+                    answer = {{
+                        "answer": (
+                            "PRELIMINARY (workers still running; consolidation pending)"
+                            if failed else f"final answer from {{role}}"
+                        ),
+                        "key_points": ["preliminary"] if failed else ["final"],
+                        "assumptions": [],
+                        "uncertainties": ["workers not reconciled"] if failed else [],
+                        "sources": [],
+                        "workstreams": workstreams,
+                        "confidence": 0.3 if failed else 0.8,
+                    }}
+                    if failed:
+                        output = pathlib.Path.cwd() / ".swarm" / "answer.json"
+                        output.parent.mkdir(parents=True, exist_ok=True)
+                        output.write_text(json.dumps(answer))
+                        print(json.dumps({{
+                            "type": "result", "session_id": session_id,
+                            "is_error": True, "result": "usage limit reached",
+                        }}), flush=True)
+                        raise SystemExit(1)
+                    print(json.dumps({{
+                        "type": "result", "session_id": session_id,
+                        "is_error": False, "structured_output": answer,
+                    }}), flush=True)
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_claude.chmod(0o755)
+            analyzer_script = root / "analyzer.py"
+            analyzer_script.write_text(
+                textwrap.dedent(
+                    """
+                    import json, pathlib, sys
+                    bundle = json.loads(pathlib.Path(sys.argv[1]).read_text())
+                    labels = [item["answer_id"] for item in bundle["answers"]]
+                    pathlib.Path(sys.argv[2]).write_text(json.dumps({
+                        "summary": "reviewed completed Claude answers",
+                        "agreement": [],
+                        "disagreements": [],
+                        "answer_assessments": [
+                            {"answer_id": label, "strengths": [], "weaknesses": [], "factual_risks": []}
+                            for label in labels
+                        ],
+                        "validated_findings": [],
+                        "unresolved_questions": [],
+                        "recommended_answer": "synthesis from completed reports",
+                        "confidence": 0.8
+                    }))
+                    """
+                ),
+                encoding="utf-8",
+            )
+            hunters = "".join(
+                textwrap.dedent(
+                    f"""
+                    [[hunters]]
+                    id = "{hunter_id}"
+                    harness = "claude-code"
+                    harness_version = "2.1.328"
+                    provider = "anthropic"
+                    model = "claude-mythos-5-2"
+                    reasoning_effort = "xhigh"
+                    workers = 2
+                    """
+                )
+                for hunter_id in ("claude-good-a", "claude-failed", "claude-good-b")
+            )
+            config_path = root / "swarm.toml"
+            config_path.write_text(
+                textwrap.dedent(
+                    f"""
+                    schema_version = 1
+                    output_root = "{root / 'runs'}"
+                    max_parallel_hunters = 3
+                    minimum_answers = 2
+
+                    [storage]
+                    cache_root = "{root / 'cache'}"
+
+                    [resources]
+                    mode = "off"
+
+                    {hunters}
+
+                    [analyzer]
+                    id = "judge"
+                    harness = "command"
+                    harness_version = "1"
+                    provider = "test"
+                    model = "judge"
+                    reasoning_effort = "high"
+                    supported_efforts = ["high"]
+                    command = ["{sys.executable}", "{analyzer_script}", "{{answers}}", "{{result}}"]
+                    """
+                ),
+                encoding="utf-8",
+            )
+            path = f"{root}{os.pathsep}{os.environ.get('PATH', '')}"
+            with mock.patch.dict(os.environ, {"PATH": path}):
+                run_dir = asyncio.run(AuditRunner(
+                    load_config(config_path),
+                    "review the target",
+                    session_id="claude-quota",
+                    round_id="first",
+                ).run())
+
+            manifest = json.loads((run_dir / "manifest.json").read_text())
+            self.assertEqual(manifest["status"], "completed")
+            self.assertTrue(manifest["degraded"])
+            failed_dir = run_dir / "hunters" / "claude-failed"
+            failed_result = json.loads((failed_dir / "result.json").read_text())
+            self.assertEqual(failed_result["status"], "failed")
+            self.assertFalse(failed_result["answer_sealed"])
+            self.assertTrue(failed_result["worker_contract_verified"])
+            self.assertEqual(failed_result["worker_completion"]["terminal"], 2)
+            self.assertFalse(failed_result["worker_completion"]["complete"])
+            self.assertEqual(failed_result["worker_monitor"]["reason"], "worker_failures")
+            self.assertEqual(
+                failed_result["worker_monitor"]["snapshot"]["outcomes"]["failed"],
+                2,
+            )
+            self.assertTrue((failed_dir / "provisional-answer.json").is_file())
+            self.assertFalse((failed_dir / "answer.json").exists())
+            self.assertFalse((failed_dir / "seal.json").exists())
+            self.assertNotIn(
+                "PRELIMINARY",
+                (run_dir / "analysis" / "blind-answers.json").read_text(),
+            )
+            self.assertNotIn(
+                "PRELIMINARY",
+                (run_dir / "final" / "answers.json").read_text(),
             )
 
     def test_claude_auth_probe_discards_identifying_account_metadata(self) -> None:

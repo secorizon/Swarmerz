@@ -477,6 +477,12 @@ compatibility copy with only the top-level schema-document metadata removed, bec
 Code builds do not register that metaschema URI. The materialized answer is still validated against
 the unchanged canonical schema before it can be sealed.
 
+For background Claude workers, the immediate “agent launched” acknowledgement is not a completion
+signal. Swarmerz waits for terminal task notifications from every configured worker and a successful
+final structured parent result. If a failed or quota-limited turn leaves an early `answer.json`, it
+is retained as `provisional-answer.json`; it does not satisfy quorum, enter the judge bundle, or
+prevent targeted recovery while peer hunters are still running.
+
 For a local adjudicator, the adapter receives the same phase contract used by hosted review:
 
 ```toml

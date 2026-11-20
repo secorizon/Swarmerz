@@ -131,6 +131,7 @@ class LiveControlTests(unittest.TestCase):
                 timeout_seconds=10,
                 provider="anthropic",
                 effective_model="claude-mythos-5-2",
+                swarm_size=2,
             )
             runner = object.__new__(AuditRunner)
             runner.config = SimpleNamespace(
@@ -151,13 +152,60 @@ class LiveControlTests(unittest.TestCase):
                 executions.append(command.argv)
                 stdout_path = Path(str(kwargs["stdout_path"]))
                 if len(executions) == 1:
-                    events = [
+                    assert command.artifact_path is not None
+                    command.artifact_path.write_text(
+                        json.dumps({"answer": "PRELIMINARY; workers still running"}),
+                        encoding="utf-8",
+                    )
+                    events: list[dict[str, object]] = [
                         {"type": "system", "subtype": "init", "session_id": "session-a"},
-                        {
-                            "type": "result", "session_id": "session-a",
-                            "is_error": True, "result": "request denied",
-                        },
                     ]
+                    for number in range(1, 3):
+                        tool_id = f"tool-{number}"
+                        task_id = f"task-{number}"
+                        events.extend((
+                            {
+                                "type": "assistant",
+                                "session_id": "session-a",
+                                "parent_tool_use_id": None,
+                                "message": {"content": [{
+                                    "type": "tool_use",
+                                    "id": tool_id,
+                                    "name": "Agent",
+                                    "input": {
+                                        "subagent_type": f"swarmerz-worker-{number:02d}",
+                                    },
+                                }]},
+                            },
+                            {
+                                "type": "system",
+                                "subtype": "task_started",
+                                "task_id": task_id,
+                                "tool_use_id": tool_id,
+                            },
+                            {
+                                "type": "user",
+                                "tool_use_result": {
+                                    "isAsync": True,
+                                    "status": "async_launched",
+                                },
+                                "message": {"content": [{
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_id,
+                                }]},
+                            },
+                            {
+                                "type": "system",
+                                "subtype": "task_notification",
+                                "task_id": task_id,
+                                "tool_use_id": tool_id,
+                                "status": "failed",
+                            },
+                        ))
+                    events.append({
+                        "type": "result", "session_id": "session-a",
+                        "is_error": True, "result": "request denied",
+                    })
                     status = "failed"
                     exit_code = 1
                 else:

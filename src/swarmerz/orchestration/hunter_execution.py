@@ -779,8 +779,11 @@ class HunterExecutionMixin:
             if self.live_control is not None:
                 self.live_control.parent_returned(engine.id)
             result.update({"hunter_id": engine.id, "answer_sealed": False})
-            if native_claude:
-                claude_workers = claude_fanout_evidence(stdout_path, engine.swarm_size)
+
+            def refresh_claude_workers() -> dict[str, Any]:
+                claude_workers = claude_fanout_evidence(
+                    stdout_path, engine.swarm_size
+                )
                 result["worker_monitor"] = claude_workers
                 result["worker_contract_verified"] = bool(claude_workers["verified"])
                 result["fanout_evidence"] = (
@@ -789,12 +792,22 @@ class HunterExecutionMixin:
                     else "unverified"
                 )
                 snapshot = claude_workers["snapshot"]
+                failures = int(snapshot.get("outcomes", {}).get("failed") or 0)
+                all_terminal = bool(snapshot.get("all_workers_terminal"))
                 result["worker_completion"] = {
                     "terminal": int(snapshot.get("terminal_workers") or 0),
                     "expected": engine.swarm_size,
-                    "complete": bool(snapshot.get("all_workers_terminal")),
-                    "reason": claude_workers["reason"],
+                    "complete": all_terminal and failures == 0,
+                    "reason": (
+                        "worker_failures" if all_terminal and failures
+                        else "all_workers_terminal" if all_terminal
+                        else claude_workers["reason"]
+                    ),
                 }
+                return claude_workers
+
+            if native_claude:
+                refresh_claude_workers()
             if engine.command or engine.harness == "command":
                 ledger = verify_worker_ledger(
                     spec.cwd, artifact_dir, minimum_workers=engine.swarm_size
@@ -810,21 +823,32 @@ class HunterExecutionMixin:
                 result["parent_forced_stop"] = parent_forced_stop
             sealed_answer: dict[str, Any] | None = None
 
+            def preserve_claude_provisional() -> None:
+                path = spec.artifact_path
+                if path is None or (not path.exists() and not path.is_symlink()):
+                    return
+                if path.is_symlink():
+                    path.unlink()
+                    result["provisional_answer_rejected"] = "symlink"
+                    return
+                if not path.is_file():
+                    return
+                provisional_path = artifact_dir / "provisional-answer.json"
+                try:
+                    if not provisional_path.exists():
+                        shutil.copy2(path, provisional_path)
+                    path.unlink()
+                except OSError as exc:
+                    result["provisional_answer_error"] = str(exc)
+                    return
+                result["provisional_answer"] = str(provisional_path)
+
             def try_seal() -> bool:
                 nonlocal sealed_answer
                 if result["answer_sealed"]:
                     return True
                 if native_claude:
-                    claude_workers = claude_fanout_evidence(
-                        stdout_path, engine.swarm_size
-                    )
-                    result["worker_monitor"] = claude_workers
-                    result["worker_contract_verified"] = bool(claude_workers["verified"])
-                    result["fanout_evidence"] = (
-                        "observed_claude_agent_calls"
-                        if result["worker_contract_verified"]
-                        else "unverified"
-                    )
+                    claude_workers = refresh_claude_workers()
                     if not result["worker_contract_verified"]:
                         observed = int(
                             claude_workers["snapshot"].get("observed_workers") or 0
@@ -833,6 +857,23 @@ class HunterExecutionMixin:
                             f"Claude Code launched {observed}/{engine.swarm_size} "
                             "verifiable Swarmerz worker agents"
                         )
+                        preserve_claude_provisional()
+                        return False
+                    snapshot = claude_workers["snapshot"]
+                    if not snapshot.get("all_workers_terminal"):
+                        terminal = int(snapshot.get("terminal_workers") or 0)
+                        result["artifact_error"] = (
+                            f"Claude Code workers reached {terminal}/{engine.swarm_size} "
+                            "terminal outcomes; answer retained as provisional"
+                        )
+                        preserve_claude_provisional()
+                        return False
+                    if not result.get("claude_final_output_ready"):
+                        result["artifact_error"] = (
+                            "Claude Code did not return a successful final structured result; "
+                            "answer retained as provisional"
+                        )
+                        preserve_claude_provisional()
                         return False
                 if engine.command or engine.harness == "command":
                     ledger = verify_worker_ledger(

@@ -159,6 +159,12 @@ establishing a session while another hunter is still running, Swarmerz marks it 
 `/to ID MESSAGE` to resume that exact session. The same targeted recovery rule applies to failed
 native Codex turns and verified native OpenCode sessions.
 
+Claude Code's asynchronous launch acknowledgement proves only that a worker started. Swarmerz uses
+the later task lifecycle notifications for terminal outcomes and requires a successful final
+structured parent result before sealing. An early JSON answer left by a failed or quota-limited
+turn is moved to `provisional-answer.json`, remains outside quorum and adjudication, and does not
+block `/to` recovery.
+
 If a configured native harness version differs from an installed Codex, Claude Code, or OpenCode
 CLI, startup uses the installed version and reports the reconciliation as an informational event.
 The profile remains unchanged. Inspect `manifest.json` → `runtime_harness_versions` for the

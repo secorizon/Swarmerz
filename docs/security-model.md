@@ -17,6 +17,9 @@ does not turn model output into a security proof or provide an operating-system 
   copy-on-write or copied view. The canonical digest is rechecked before and after adjudication;
   a mismatch fails the round. Symlinks are skipped unless explicitly allowed.
 - Structured answers are validated against packaged JSON schemas before sealing.
+- Native Claude answers additionally require terminal lifecycle evidence for every configured
+  worker and a successful final structured parent result. Asynchronous launch acknowledgements and
+  early JSON placeholders are not treated as completed reports.
 - Seals record SHA-256 integrity metadata and make staged files read-only.
 - The primary analyzer receives a freshly shuffled blind bundle and captured evidence from opaque
   scratch staging rather than the identified round tree. The private answer map is written only

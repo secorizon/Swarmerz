@@ -37,6 +37,7 @@ from .artifacts import (
 from .codex_models import check_chatgpt_codex_models
 from .codex_appserver import CodexAppServer
 from .claude_code import (
+    claude_fanout_evidence,
     claude_resume_spec as _claude_resume_spec,
     is_native_claude,
     materialize_claude_output,
@@ -870,6 +871,22 @@ class AuditRunner(SessionLifecycleMixin, HunterExecutionMixin, AdjudicationMixin
         )
         if claude_hunter:
             self.live_control.register_claude(role)
+
+        def claude_hunter_artifact_ready(candidate: dict[str, Any]) -> bool:
+            if not candidate.get("claude_final_output_ready"):
+                return False
+            if not spec.artifact_path or not spec.artifact_path.is_file():
+                return False
+            try:
+                if not isinstance(read_json(spec.artifact_path), dict):
+                    return False
+            except (ConfigError, OSError):
+                return False
+            fanout = claude_fanout_evidence(stdout_path, engine.swarm_size)
+            return bool(
+                fanout.get("verified")
+                and fanout["snapshot"].get("all_workers_terminal")
+            )
         if (
             self.live_control is not None and is_native_codex
             and role == engine.id
@@ -1004,6 +1021,10 @@ class AuditRunner(SessionLifecycleMixin, HunterExecutionMixin, AdjudicationMixin
                     result["claude_session_id"] = session_id
                 if claude_inspection.get("result_error") and not result.get("error"):
                     result["error"] = str(claude_inspection["result_error"])
+                result["claude_final_output_ready"] = bool(
+                    result.get("status") == "completed"
+                    and claude_inspection.get("structured_output_ready")
+                )
             diagnostic = _diagnostic_tail(stderr_path) or _json_error_diagnostic(stdout_path)
             attempts.append({**result, "diagnostic": diagnostic})
 
@@ -1027,12 +1048,7 @@ class AuditRunner(SessionLifecycleMixin, HunterExecutionMixin, AdjudicationMixin
 
         if claude_hunter:
             session_id = result.get("claude_session_id")
-            artifact_ready = False
-            if spec.artifact_path and spec.artifact_path.is_file():
-                try:
-                    artifact_ready = isinstance(read_json(spec.artifact_path), dict)
-                except (ConfigError, OSError):
-                    artifact_ready = False
+            artifact_ready = claude_hunter_artifact_ready(result)
             initial_failure = dict(result) if not artifact_ready else None
             recovery_attempts: list[dict[str, Any]] = []
             while (
@@ -1087,6 +1103,10 @@ class AuditRunner(SessionLifecycleMixin, HunterExecutionMixin, AdjudicationMixin
                     recovery_result["claude_session_id"] = session_id
                 if inspection.get("result_error"):
                     recovery_result["error"] = str(inspection["result_error"])
+                recovery_result["claude_final_output_ready"] = bool(
+                    recovery_result.get("status") == "completed"
+                    and inspection.get("structured_output_ready")
+                )
                 recovery_result["duration_seconds"] = round(
                     time.monotonic() - recovery_started, 3
                 )
@@ -1097,14 +1117,7 @@ class AuditRunner(SessionLifecycleMixin, HunterExecutionMixin, AdjudicationMixin
                     **recovery_result,
                 })
                 result = recovery_result
-                try:
-                    artifact_ready = bool(
-                        spec.artifact_path
-                        and spec.artifact_path.is_file()
-                        and isinstance(read_json(spec.artifact_path), dict)
-                    )
-                except (ConfigError, OSError):
-                    artifact_ready = False
+                artifact_ready = claude_hunter_artifact_ready(result)
             if recovery_attempts:
                 result = dict(result)
                 result["initial_failure"] = initial_failure

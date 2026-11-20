@@ -17,6 +17,10 @@ from .models import CommandSpec, ConfigError, EngineConfig
 CLAUDE_CODE_HARNESSES = {"claude-code"}
 _HUNTER_TOOLS = "Bash,Read,Write,Edit,Glob,Grep,Agent"
 _ADJUDICATOR_TOOLS = "Bash,Read,Write,Edit,Glob,Grep"
+_TASK_SUCCESS_STATES = {"completed", "succeeded", "success"}
+_TASK_FAILURE_STATES = {
+    "cancelled", "canceled", "error", "failed", "stopped", "timed_out", "timeout",
+}
 
 
 def is_native_claude(engine: EngineConfig) -> bool:
@@ -120,12 +124,15 @@ def iter_claude_events(path: Path) -> Iterable[dict[str, Any]]:
 
 
 def inspect_claude_stream(path: Path) -> dict[str, Any]:
-    """Return the last session/result and observable Agent calls in a JSONL stream."""
+    """Return the last top-level result and observable Agent task lifecycles."""
     session_id: str | None = None
     structured_output: dict[str, Any] | None = None
     result_error: str | None = None
+    result_seen = False
+    structured_output_ready = False
     calls: dict[str, dict[str, Any]] = {}
     outcomes: dict[str, str] = {}
+    task_tools: dict[str, str] = {}
     for event in iter_claude_events(path):
         candidate_session = event.get("session_id")
         if isinstance(candidate_session, str) and candidate_session:
@@ -150,25 +157,87 @@ def inspect_claude_stream(path: Path) -> dict[str, Any]:
                             "name": str(inputs.get("subagent_type") or ""),
                             "description": str(inputs.get("description") or ""),
                         }
+        elif event_type == "system":
+            subtype = event.get("subtype")
+            task_id = event.get("task_id")
+            tool_id = event.get("tool_use_id")
+            if (
+                subtype == "task_started"
+                and isinstance(task_id, str)
+                and isinstance(tool_id, str)
+                and tool_id in calls
+            ):
+                task_tools[task_id] = tool_id
+            if subtype in {"task_updated", "task_notification"}:
+                patch = event.get("patch") if isinstance(event.get("patch"), dict) else {}
+                status = event.get("status") or patch.get("status")
+                resolved_tool = (
+                    tool_id if isinstance(tool_id, str) and tool_id in calls
+                    else task_tools.get(task_id) if isinstance(task_id, str)
+                    else None
+                )
+                if isinstance(resolved_tool, str) and isinstance(status, str):
+                    normalized = status.strip().lower()
+                    if normalized in _TASK_SUCCESS_STATES:
+                        outcomes[resolved_tool] = "succeeded"
+                    elif normalized in _TASK_FAILURE_STATES:
+                        outcomes[resolved_tool] = "failed"
         elif event_type == "user":
             message = event.get("message") if isinstance(event.get("message"), dict) else {}
             content = message.get("content") if isinstance(message.get("content"), list) else []
+            tool_result = (
+                event.get("tool_use_result")
+                if isinstance(event.get("tool_use_result"), dict)
+                else {}
+            )
+            async_launch = bool(
+                tool_result.get("isAsync") is True
+                or tool_result.get("status") == "async_launched"
+            )
             for block in content:
                 if not isinstance(block, dict) or block.get("type") != "tool_result":
                     continue
                 tool_id = block.get("tool_use_id")
-                if isinstance(tool_id, str) and tool_id in calls:
+                # Background Agent calls immediately emit a successful tool_result
+                # that means only "launched". Their real terminal state arrives in
+                # system task_notification/task_updated events.
+                known_async = tool_id in task_tools.values()
+                if (
+                    not async_launch
+                    and not known_async
+                    and isinstance(tool_id, str)
+                    and tool_id in calls
+                ):
                     outcomes[tool_id] = (
                         "failed" if bool(block.get("is_error")) else "succeeded"
                     )
-        elif event_type == "result":
+        elif (
+            event_type == "result"
+            and event.get("parent_tool_use_id") is None
+            and not event.get("agent_id")
+            and not (
+                isinstance(event.get("origin"), dict)
+                and event["origin"].get("kind") == "task-notification"
+            )
+        ):
+            # Appended recovery turns share one JSONL file. Only the last
+            # top-level result is authoritative; a later failure must not reuse
+            # structured output from an earlier turn.
+            result_seen = True
             candidate = event.get("structured_output")
-            if isinstance(candidate, dict):
+            is_error = bool(event.get("is_error"))
+            if not is_error and isinstance(candidate, dict):
                 structured_output = candidate
-            if event.get("is_error"):
+                structured_output_ready = True
+                result_error = None
+            else:
+                structured_output = None
+                structured_output_ready = False
+                if not is_error:
+                    result_error = None
+            if is_error:
                 detail = event.get("result") or event.get("error") or event.get("subtype")
-                if detail:
-                    result_error = str(detail)
+                result_error = str(detail) if detail else "Claude Code turn failed"
     children = []
     for tool_id, call in calls.items():
         outcome = outcomes.get(tool_id)
@@ -183,6 +252,8 @@ def inspect_claude_stream(path: Path) -> dict[str, Any]:
     return {
         "session_id": session_id,
         "structured_output": structured_output,
+        "structured_output_ready": structured_output_ready,
+        "result_seen": result_seen,
         "result_error": result_error,
         "calls": list(calls.values()),
         "children": children,
@@ -226,9 +297,17 @@ def claude_fanout_evidence(path: Path, expected_workers: int) -> dict[str, Any]:
         "earliest_created_ms": 0,
         "children": inspection["children"],
     }
+    if not verified:
+        reason = "agent_calls_incomplete"
+    elif not snapshot["all_workers_terminal"]:
+        reason = "workers_active"
+    elif snapshot["outcomes"]["failed"]:
+        reason = "worker_failures"
+    else:
+        reason = "all_workers_terminal"
     return {
         "verified": verified,
-        "reason": "agent_calls_verified" if verified else "agent_calls_incomplete",
+        "reason": reason,
         "snapshot": snapshot,
     }
 
