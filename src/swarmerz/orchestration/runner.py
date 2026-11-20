@@ -26,11 +26,11 @@ from .adapters import (
 from .adjudication import AdjudicationMixin
 from .artifacts import (
     attribute_analysis,
+    evidence_contract_error,
     randomized_answer_order,
     read_json,
     seal_answer,
     sha256_file,
-    verified_reproduction_references,
     write_final_report,
     write_json,
 )
@@ -100,33 +100,11 @@ def _hunter_progress_name(engine: EngineConfig) -> str:
     return engine.id
 
 
-_PROVENANCE_CLASSES = {
-    "independent_discovery", "prior_artifact_corroboration", "derived",
-}
 _VALIDATION_METHODS = {"executed_reproduction", "source_inspection", "reasoning_only"}
 
 
 def _valid_evidence_contract(record: Any, workspace: Path | None = None) -> bool:
-    if not isinstance(record, dict):
-        return False
-    reproduction = record.get("reproduction")
-    structurally_valid = (
-        record.get("provenance_class") in _PROVENANCE_CLASSES
-        and record.get("validation_method") in _VALIDATION_METHODS
-        and isinstance(reproduction, dict)
-        and isinstance(reproduction.get("commands"), list)
-        and all(isinstance(item, str) for item in reproduction["commands"])
-        and isinstance(reproduction.get("observed_result"), str)
-        and bool(reproduction["observed_result"].strip())
-        and isinstance(reproduction.get("artifact_refs"), list)
-        and all(isinstance(item, str) for item in reproduction["artifact_refs"])
-    )
-    if not structurally_valid:
-        return False
-    return (
-        workspace is None
-        or verified_reproduction_references(record, workspace) is not None
-    )
+    return evidence_contract_error(record, workspace) is None
 
 
 @asynccontextmanager
@@ -1812,7 +1790,8 @@ class AuditRunner(SessionLifecycleMixin, HunterExecutionMixin, AdjudicationMixin
             previous = [
                 analysis_dir / name
                 for name in (
-                    "analysis.json", "accepted-analysis.json", "stdout.jsonl", "stderr.log",
+                    "analysis.json", "analysis.raw.json", "accepted-analysis.json",
+                    "stdout.jsonl", "stderr.log",
                     "result.json", "launch.json", "instruction.md", "blind-answers.json",
                     "blind-evidence-index.json", "answer-map.json",
                     "reproduction-seal.json", "evidence",
@@ -1875,6 +1854,7 @@ class AuditRunner(SessionLifecycleMixin, HunterExecutionMixin, AdjudicationMixin
                 adjudication=_adjudicator_disclosure(self.config),
                 baseline=baseline,
                 verification=verification,
+                analyzer_result=analyzer_result,
                 fanout_evidence=[
                     {
                         "hunter_id": result.get("hunter_id"),

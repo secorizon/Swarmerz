@@ -98,6 +98,7 @@ sessions/<session>/
     ├── baseline/baseline.json
     ├── analysis/
     │   ├── analysis.json
+    │   ├── analysis.raw.json
     │   ├── accepted-analysis.json
     │   ├── blind-answers.json
     │   ├── blind-evidence-index.json
@@ -114,6 +115,13 @@ sessions/<session>/
 Optional directories appear only when their features run. `manifest.json` is authoritative for
 status, coverage, degradation, and lifecycle state. A draft or `partial-notes.md` is not a sealed
 answer.
+
+`analysis.raw.json` appears only when Swarmerz performs a deterministic metadata repair. If a
+source-inspection finding cites regular `context/` files in its evidence list but omits the same
+paths from `reproduction.artifact_refs`, Swarmerz promotes those already-cited paths, verifies and
+seals them, preserves the model's original output in `analysis.raw.json`, and records the repair in
+`analysis/result.json`. No finding text, severity, attribution, or validation claim is synthesized
+by this repair.
 
 Successful workspaces are removable scratch after referenced evidence is staged and hashed.
 Incomplete or failed workspaces can be retained for recovery according to storage policy.
@@ -147,6 +155,10 @@ swarmerz analyze \
 
 This verifies existing seals and does not rerun hunters. Use `--adopt-late-answers` only after
 reviewing a valid answer that arrived after failure; adoption remains explicitly recorded.
+
+When a judge emits structured output that cannot satisfy the evidence contract, the final report
+states that the output was produced but rejected and includes the exact finding and contract error.
+The raw judge artifacts remain under `analysis/`; they are not presented as an accepted synthesis.
 
 ### Hunter is blocked
 

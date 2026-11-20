@@ -236,6 +236,10 @@ def preserve_workspace_artifacts(workspace: Path, artifact_dir: Path) -> dict[st
 
 
 _LOCATION_SUFFIX = re.compile(r"^(?P<path>.+?):(?P<line>[1-9][0-9]*)(?::[1-9][0-9]*)?$")
+_PROVENANCE_CLASSES = {
+    "independent_discovery", "prior_artifact_corroboration", "derived",
+}
+_VALIDATION_METHODS = {"executed_reproduction", "source_inspection", "reasoning_only"}
 
 
 def verified_reproduction_references(
@@ -313,6 +317,89 @@ def verified_reproduction_references(
     ):
         return None
     return resolved_references
+
+
+def promote_source_inspection_references(
+    record: dict[str, Any], workspace: Path,
+) -> list[str]:
+    """Promote already-cited source paths into an omitted reproduction contract.
+
+    Structured-output models occasionally put inspected source locations in the
+    finding's ``evidence`` list but leave ``reproduction.artifact_refs`` empty.
+    This repair is intentionally narrow: it applies only to source inspection,
+    only when the explicit reference list is empty, and only to regular files
+    that resolve inside the frozen context view.
+    """
+    if record.get("validation_method") != "source_inspection":
+        return []
+    reproduction = record.get("reproduction")
+    evidence = record.get("evidence")
+    if (
+        not isinstance(reproduction, dict)
+        or not isinstance(reproduction.get("artifact_refs"), list)
+        or reproduction["artifact_refs"]
+        or not isinstance(evidence, list)
+    ):
+        return []
+
+    promoted: list[str] = []
+    seen: set[str] = set()
+    for item in evidence:
+        if (
+            not isinstance(item, str)
+            or not item.strip()
+            or not item.startswith("context/")
+            or item in seen
+        ):
+            continue
+        candidate = copy.deepcopy(record)
+        candidate["reproduction"]["artifact_refs"] = [item]
+        if verified_reproduction_references(candidate, workspace) is None:
+            continue
+        promoted.append(item)
+        seen.add(item)
+
+    if promoted:
+        reproduction["artifact_refs"] = promoted
+    return promoted
+
+
+def evidence_contract_error(
+    record: Any, workspace: Path | None = None,
+) -> str | None:
+    """Return a stable explanation when a finding's evidence contract is invalid."""
+    if not isinstance(record, dict):
+        return "finding is not an object"
+    if record.get("provenance_class") not in _PROVENANCE_CLASSES:
+        return "provenance_class is missing or unsupported"
+    method = record.get("validation_method")
+    if method not in _VALIDATION_METHODS:
+        return "validation_method is missing or unsupported"
+    reproduction = record.get("reproduction")
+    if not isinstance(reproduction, dict):
+        return "reproduction is not an object"
+    commands = reproduction.get("commands")
+    if not isinstance(commands, list) or not all(
+        isinstance(item, str) and item.strip() for item in commands
+    ):
+        return "reproduction.commands must contain only nonempty strings"
+    observed = reproduction.get("observed_result")
+    if not isinstance(observed, str) or not observed.strip():
+        return "reproduction.observed_result must be a nonempty string"
+    references = reproduction.get("artifact_refs")
+    if not isinstance(references, list) or not all(
+        isinstance(item, str) and item.strip() for item in references
+    ):
+        return "reproduction.artifact_refs must contain only nonempty strings"
+    if method == "source_inspection" and not references:
+        return "source_inspection requires at least one regular source reference"
+    if method == "executed_reproduction" and not commands:
+        return "executed_reproduction requires at least one command"
+    if method == "executed_reproduction" and not references:
+        return "executed_reproduction requires at least one captured artifact reference"
+    if workspace is not None and verified_reproduction_references(record, workspace) is None:
+        return "one or more reproduction references do not resolve to allowed regular files"
+    return None
 
 
 def preserve_reproduction_references(
@@ -532,6 +619,7 @@ def write_final_report(
     baseline: dict[str, Any] | None = None,
     verification: dict[str, Any] | None = None,
     fanout_evidence: list[dict[str, Any]] | None = None,
+    analyzer_result: dict[str, Any] | None = None,
 ) -> None:
     labeled = []
     labels = answer_labels(len(answers)) if answers else ()
@@ -654,14 +742,58 @@ def write_final_report(
             "",
         ])
     if analysis is None:
-        lines.extend(
-            [
-                "## Adjudicator analysis",
-                "",
-                "Not produced because the configured hunter-answer quorum was not reached or the analyzer failed.",
-                "",
-            ]
-        )
+        lines.extend(["## Adjudicator analysis", ""])
+        if analyzer_result is None:
+            lines.extend(
+                [
+                    "Not run because the configured hunter-answer quorum was not reached.",
+                    "",
+                ]
+            )
+        elif analyzer_result.get("analysis_valid") is False:
+            detail = str(
+                analyzer_result.get("artifact_error")
+                or "the structured evidence contract was not satisfied"
+            ).replace("\n", " ")
+            lines.extend(
+                [
+                    "The adjudicator produced structured output, but Swarmerz rejected it "
+                    "during final evidence validation.",
+                    "",
+                    f"Validation error: {detail}",
+                    "",
+                    "The raw judge artifacts remain under `analysis/`; they are not an "
+                    "accepted final Swarmerz result.",
+                    "",
+                ]
+            )
+        elif analyzer_result.get("analysis_valid") is True:
+            lines.extend(
+                [
+                    "The primary adjudicator produced a valid structured analysis, but it "
+                    "did not pass the remaining configured acceptance stages.",
+                    "",
+                    "Check `secondary-analysis/` and `manifest.json` for the verifier result. "
+                    "The primary output remains under `analysis/` and is not presented as the "
+                    "final Swarmerz synthesis.",
+                    "",
+                ]
+            )
+        else:
+            detail = str(
+                analyzer_result.get("error")
+                or analyzer_result.get("diagnostic")
+                or analyzer_result.get("status")
+                or "unknown analyzer failure"
+            ).replace("\n", " ")
+            lines.extend(
+                [
+                    "The adjudicator did not produce an accepted structured analysis.",
+                    "",
+                    f"Analyzer result: {detail}",
+                    "",
+                ]
+            )
     else:
         lines.extend(
             [

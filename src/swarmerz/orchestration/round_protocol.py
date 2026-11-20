@@ -144,6 +144,7 @@ async def execute_round_protocol(
             adjudication=adjudicator_disclosure(runner.config),
             baseline=baseline,
             verification=verification,
+            analyzer_result=analyzer_result,
             fanout_evidence=[
                 {
                     "hunter_id": result.get("hunter_id"),

@@ -1821,6 +1821,108 @@ class IntegrationTests(unittest.TestCase):
             self.assertIn("--continue", output.getvalue())
             self.assertNotIn("Do not print raw JSON", output.getvalue())
 
+    def test_judge_source_citations_fill_omitted_reproduction_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            context = root / "target"
+            context.mkdir()
+            (context / "file.c").write_text(
+                "int state_survives_reset;\n", encoding="utf-8"
+            )
+            hunter_script = root / "hunter.py"
+            hunter_script.write_text(
+                "import json, pathlib, sys\n"
+                "output = pathlib.Path(sys.argv[1])\n"
+                "output.write_text(json.dumps({"
+                "'answer':'state survives reset','key_points':[],'assumptions':[],"
+                "'uncertainties':[],'sources':['context/file.c:1'],"
+                "'workstreams':[{'name':'source','scope':'state','conclusion':'found'},"
+                "{'name':'review','scope':'reset','conclusion':'confirmed'}],"
+                "'confidence':0.8}))\n"
+                "evidence = output.parent / 'worker-evidence.txt'\n"
+                "evidence.write_text('worker evidence')\n"
+                "(output.parent / 'worker-ledger.json').write_text(json.dumps({'workers':["
+                "{'worker_id':'source','scope':'state','status':'completed',"
+                "'evidence_refs':['.swarm/worker-evidence.txt']},"
+                "{'worker_id':'review','scope':'reset','status':'completed',"
+                "'evidence_refs':['.swarm/worker-evidence.txt']}] }))\n",
+                encoding="utf-8",
+            )
+            analyzer_script = root / "analyzer.py"
+            analyzer_script.write_text(
+                "import json, pathlib, sys\n"
+                "bundle = json.loads(pathlib.Path(sys.argv[1]).read_text())\n"
+                "labels = [item['answer_id'] for item in bundle['answers']]\n"
+                "pathlib.Path(sys.argv[2]).write_text(json.dumps({"
+                "'summary':'source inspected','agreement':[],'disagreements':[],"
+                "'answer_assessments':[{'answer_id':x,'strengths':[],"
+                "'weaknesses':[],'factual_risks':[]} for x in labels],"
+                "'validated_findings':[{'title':'State survives reset','severity':'medium',"
+                "'source_answer_ids':labels,'validation':'The reset omits the field.',"
+                "'evidence':['context/file.c:1'],"
+                "'provenance_class':'independent_discovery',"
+                "'validation_method':'source_inspection','reproduction':{"
+                "'commands':[],'observed_result':'The field remains set.',"
+                "'artifact_refs':[]}}],"
+                "'unresolved_questions':[],'recommended_answer':'Fix the reset path.',"
+                "'confidence':0.9}))\n",
+                encoding="utf-8",
+            )
+            hunters = "".join(
+                f'[[hunters]]\nid = "{name}"\nharness = "command"\n'
+                f'harness_version = "1"\nprovider = "test"\nmodel = "fake"\n'
+                f'reasoning_effort = "low"\nsupported_efforts = ["low"]\nworkers = 2\n'
+                f'command = ["{sys.executable}", "{hunter_script}", "{{answer}}"]\n'
+                for name in ("one", "two")
+            )
+            config_path = root / "swarm.toml"
+            config_path.write_text(
+                f'schema_version = 1\noutput_root = "{root / "runs"}"\n'
+                f'minimum_answers = 2\n{hunters}\n[storage]\n'
+                f'cache_root = "{root / "cache"}"\n[analyzer]\n'
+                f'id = "judge"\nharness = "command"\nharness_version = "1"\n'
+                f'provider = "test"\nmodel = "fake-judge"\nreasoning_effort = "low"\n'
+                f'supported_efforts = ["low"]\n'
+                f'command = ["{sys.executable}", "{analyzer_script}", '
+                '"{answers}", "{result}"]\n',
+                encoding="utf-8",
+            )
+
+            run_dir = asyncio.run(
+                AuditRunner(
+                    load_config(config_path),
+                    "review state handling",
+                    context_override=str(context),
+                    session_id="reference-repair",
+                    round_id="first",
+                ).run()
+            )
+
+            manifest = json.loads((run_dir / "manifest.json").read_text())
+            self.assertEqual(manifest["status"], "completed")
+            raw = json.loads((run_dir / "analysis" / "analysis.raw.json").read_text())
+            normalized = json.loads((run_dir / "analysis" / "analysis.json").read_text())
+            self.assertEqual(
+                raw["validated_findings"][0]["reproduction"]["artifact_refs"], []
+            )
+            self.assertEqual(
+                normalized["validated_findings"][0]["reproduction"]["artifact_refs"],
+                ["context/file.c:1"],
+            )
+            result = json.loads((run_dir / "analysis" / "result.json").read_text())
+            self.assertTrue(result["analysis_valid"])
+            self.assertEqual(len(result["raw_analysis_sha256"]), 64)
+            self.assertEqual(len(result["normalized_reproduction_references"]), 1)
+            seal = json.loads(
+                (run_dir / "analysis" / "reproduction-seal.json").read_text()
+            )
+            self.assertEqual(seal["findings"][0]["references"][0]["kind"], "context")
+            final = json.loads((run_dir / "final" / "analysis.json").read_text())
+            self.assertIn("State survives reset", final["validated_findings"][0]["title"])
+            report = (run_dir / "final" / "report.md").read_text()
+            self.assertIn("Fix the reset path.", report)
+            self.assertNotIn("Swarmerz rejected it", report)
+
     def test_failed_analysis_retries_sealed_answers_without_rerunning_hunters(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

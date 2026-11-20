@@ -11,7 +11,13 @@ from types import SimpleNamespace
 
 import pytest
 
+from swarmerz.orchestration.adjudication import (
+    _analysis_contract_error,
+    _promote_analysis_source_references,
+)
 from swarmerz.orchestration.artifacts import (
+    evidence_contract_error,
+    promote_source_inspection_references,
     randomized_answer_order,
     read_answer,
     verified_reproduction_references,
@@ -127,6 +133,119 @@ def test_reproduction_references_must_resolve_to_captured_files(tmp_path: Path) 
     reproduced["reproduction"]["artifact_refs"] = [".swarm/artifacts/trigger.txt"]
     reproduced["reproduction"]["commands"] = [""]
     assert verified_reproduction_references(reproduced, workspace) is None
+
+
+def test_source_inspection_promotes_existing_evidence_paths(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    source = workspace / "context" / "ssl" / "record.c"
+    source.parent.mkdir(parents=True)
+    source.write_text("int inspect_me(void) { return 1; }\n", encoding="utf-8")
+    finding = {
+        "title": "State survives reset",
+        "evidence": [
+            "source reasoning",
+            "context/ssl/record.c:1",
+            "context/ssl/record.c:1",
+            "context/missing.c:9",
+            ".swarm/evidence/A/report.txt",
+        ],
+        "provenance_class": "independent_discovery",
+        "validation_method": "source_inspection",
+        "reproduction": {
+            "commands": [],
+            "observed_result": "the reset omits the state field",
+            "artifact_refs": [],
+        },
+    }
+
+    self_error = evidence_contract_error(finding, workspace)
+    assert self_error == "source_inspection requires at least one regular source reference"
+    assert promote_source_inspection_references(finding, workspace) == [
+        "context/ssl/record.c:1"
+    ]
+    assert finding["reproduction"]["artifact_refs"] == ["context/ssl/record.c:1"]
+    assert evidence_contract_error(finding, workspace) is None
+
+
+def test_source_reference_promotion_does_not_weaken_other_contracts(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    source = workspace / "context" / "source.c"
+    source.parent.mkdir(parents=True)
+    source.write_text("int main(void) {}\n", encoding="utf-8")
+    finding = {
+        "evidence": ["context/source.c:1"],
+        "provenance_class": "independent_discovery",
+        "validation_method": "executed_reproduction",
+        "reproduction": {
+            "commands": ["run-trigger"],
+            "observed_result": "triggered",
+            "artifact_refs": [],
+        },
+    }
+
+    assert promote_source_inspection_references(finding, workspace) == []
+    assert evidence_contract_error(finding, workspace) == (
+        "executed_reproduction requires at least one captured artifact reference"
+    )
+
+
+def test_analysis_contract_repairs_omitted_refs_and_names_unrepairable_finding(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    source = workspace / "context" / "ssl" / "state.c"
+    source.parent.mkdir(parents=True)
+    source.write_text("int state;\n", encoding="utf-8")
+    analysis = {
+        "summary": "reviewed",
+        "agreement": [],
+        "disagreements": [],
+        "answer_assessments": [
+            {"answer_id": "A", "strengths": [], "weaknesses": [], "factual_risks": []}
+        ],
+        "validated_findings": [
+            {
+                "title": "State survives reset",
+                "severity": "medium",
+                "source_answer_ids": ["A"],
+                "validation": "The reset omits this field.",
+                "evidence": ["context/ssl/state.c:1"],
+                "provenance_class": "independent_discovery",
+                "validation_method": "source_inspection",
+                "reproduction": {
+                    "commands": [],
+                    "observed_result": "state remains set",
+                    "artifact_refs": [],
+                },
+            }
+        ],
+        "unresolved_questions": [],
+        "recommended_answer": "Fix the reset path.",
+        "confidence": 0.8,
+    }
+
+    repairs = _promote_analysis_source_references(analysis, workspace)
+    assert repairs == [
+        {
+            "finding_index": 0,
+            "title": "State survives reset",
+            "artifact_refs": ["context/ssl/state.c:1"],
+            "source": "finding.evidence",
+        }
+    ]
+    assert _analysis_contract_error(
+        analysis, expected_ids={"A"}, workspace=workspace
+    ) is None
+
+    analysis["validated_findings"][0]["reproduction"]["artifact_refs"] = []
+    analysis["validated_findings"][0]["evidence"] = ["no resolvable source path"]
+    assert _promote_analysis_source_references(analysis, workspace) == []
+    assert _analysis_contract_error(
+        analysis, expected_ids={"A"}, workspace=workspace
+    ) == (
+        'validated_findings[0] "State survives reset": source_inspection requires '
+        "at least one regular source reference"
+    )
 
 
 def test_session_lock_recovers_stale_marker_but_blocks_live_owner(tmp_path: Path) -> None:

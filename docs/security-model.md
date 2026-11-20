@@ -26,7 +26,11 @@ does not turn model output into a security proof or provide an operating-system 
   after that analyzer exits.
 - Source-inspection references must resolve to regular context files. Executed reproductions require
   nonempty commands and at least one regular captured artifact; accepted references are preserved
-  with SHA-256 metadata in `reproduction-seal.json`.
+  with SHA-256 metadata in `reproduction-seal.json`. When a source-inspection finding already cites
+  valid `context/` paths in its evidence list but omits them from the reproduction record, Swarmerz
+  may copy only those verified paths into the record. The original model output and a machine-readable
+  repair ledger remain preserved; unresolved contract failures still fail closed with a finding-level
+  diagnostic.
 - Missing hunters, partial fan-out, late answers, permission rejection, and degraded coverage remain
   explicit in durable artifacts.
 - Optional secondary verification must use a different provider or effective model.

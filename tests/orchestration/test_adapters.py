@@ -528,6 +528,10 @@ class AdapterTests(unittest.TestCase):
         self.assertIn("mark it unsupported", instruction)
         self.assertIn(".swarm/evidence-index.json", instruction)
         self.assertIn("opaque analyzer workspace", instruction)
+        self.assertIn(
+            "put those paths in reproduction.artifact_refs, not only in evidence",
+            instruction,
+        )
 
     def test_hunter_is_told_to_use_shared_validated_findings_as_evidence(self) -> None:
         config = load_config(PROJECT_ROOT / "swarmerz.toml")
@@ -602,6 +606,26 @@ class AdapterTests(unittest.TestCase):
             saved = (final_dir / "answers.json").read_text(encoding="utf-8")
             self.assertIn('"answer_id": "A"', saved)
             self.assertIn("# Swarmerz Report", (final_dir / "report.md").read_text())
+
+            write_final_report(
+                final_dir,
+                instruction="task",
+                answers=[],
+                analysis=None,
+                analyzer_result={
+                    "status": "completed",
+                    "analysis_valid": False,
+                    "artifact_error": (
+                        'validated_findings[2] "State survives reset": '
+                        "source_inspection requires at least one regular source reference"
+                    ),
+                },
+            )
+            report = (final_dir / "report.md").read_text(encoding="utf-8")
+            self.assertIn("produced structured output", report)
+            self.assertIn("Swarmerz rejected it", report)
+            self.assertIn('validated_findings[2] "State survives reset"', report)
+            self.assertNotIn("Not produced", report)
 
     def test_validated_findings_receive_post_review_hunter_headers(self) -> None:
         analysis = {

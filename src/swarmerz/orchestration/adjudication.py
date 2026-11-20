@@ -19,8 +19,10 @@ from .adapters import (
 from .artifacts import (
     answer_labels,
     build_blind_bundle,
+    evidence_contract_error,
     preserve_reproduction_references,
     preserve_workspace_artifacts,
+    promote_source_inspection_references,
     randomized_answer_order,
     read_json,
     sha256_file,
@@ -36,6 +38,87 @@ from .models import AnalyzerConfig, CommandSpec, ConfigError
 from .protocol_support import engine_manifest as _engine_manifest
 from .schema_validation import schema_error
 from .session_context import copy_independent_file
+
+
+def _promote_analysis_source_references(
+    analysis: Any, workspace: Path,
+) -> list[dict[str, Any]]:
+    """Repair omitted source-inspection refs from paths the judge already cited."""
+    findings = analysis.get("validated_findings") if isinstance(analysis, dict) else None
+    if not isinstance(findings, list):
+        return []
+    repairs: list[dict[str, Any]] = []
+    for index, finding in enumerate(findings):
+        if not isinstance(finding, dict):
+            continue
+        promoted = promote_source_inspection_references(finding, workspace)
+        if promoted:
+            repairs.append(
+                {
+                    "finding_index": index,
+                    "title": str(finding.get("title", "")),
+                    "artifact_refs": promoted,
+                    "source": "finding.evidence",
+                }
+            )
+    return repairs
+
+
+def _analysis_contract_error(
+    analysis: Any, *, expected_ids: set[str], workspace: Path,
+) -> str | None:
+    problem = schema_error(analysis, "analysis.schema.json")
+    if problem is not None:
+        return problem
+    if not isinstance(analysis, dict):
+        return "analysis is not an object"
+    recommended = analysis.get("recommended_answer")
+    if not isinstance(recommended, str) or not recommended.strip():
+        return "recommended_answer must be a nonempty string"
+    assessments = analysis.get("answer_assessments")
+    if not isinstance(assessments, list):
+        return "answer_assessments must be an array"
+    if len(assessments) != len(expected_ids):
+        return (
+            f"answer_assessments has {len(assessments)} entries; "
+            f"expected {len(expected_ids)}"
+        )
+    assessment_ids = [
+        item.get("answer_id") for item in assessments if isinstance(item, dict)
+    ]
+    if len(assessment_ids) != len(assessments) or set(assessment_ids) != expected_ids:
+        return "answer_assessments must cover each blind answer ID exactly once"
+    if len(set(assessment_ids)) != len(assessment_ids):
+        return "answer_assessments contains a duplicate blind answer ID"
+
+    findings = analysis.get("validated_findings")
+    if not isinstance(findings, list):
+        return "validated_findings must be an array"
+    for index, finding in enumerate(findings):
+        title = (
+            str(finding.get("title", "")).strip()
+            if isinstance(finding, dict)
+            else ""
+        )
+        label = f'validated_findings[{index}] "{title or "untitled"}"'
+        if not isinstance(finding, dict):
+            return f"{label}: finding is not an object"
+        validation = finding.get("validation")
+        if not isinstance(validation, str) or not validation.strip():
+            return f"{label}: validation must be a nonempty string"
+        source_ids = finding.get("source_answer_ids")
+        if not isinstance(source_ids, list) or not source_ids:
+            return f"{label}: source_answer_ids must not be empty"
+        if not all(isinstance(source_id, str) for source_id in source_ids):
+            return f"{label}: source_answer_ids must contain only strings"
+        if len(set(source_ids)) != len(source_ids):
+            return f"{label}: source_answer_ids contains duplicates"
+        if not set(source_ids) <= expected_ids:
+            return f"{label}: source_answer_ids contains an unknown blind answer ID"
+        evidence_problem = evidence_contract_error(finding, workspace)
+        if evidence_problem is not None:
+            return f"{label}: {evidence_problem}"
+    return None
 
 
 class AdjudicationMixin:
@@ -414,43 +497,29 @@ class AdjudicationMixin:
             analysis = parse_json_output(execution_dir / "stdout.jsonl")
             if isinstance(analysis, dict) and spec.artifact_path:
                 write_json(spec.artifact_path, analysis)
-        assessments = analysis.get("answer_assessments") if isinstance(analysis, dict) else None
-        analysis_schema_problem = schema_error(analysis, "analysis.schema.json")
-        assessment_ids = (
-            {item.get("answer_id") for item in assessments if isinstance(item, dict)}
-            if isinstance(assessments, list)
-            else set()
-        )
         expected_ids = set(answer_labels(len(answers)))
-        findings = analysis.get("validated_findings") if isinstance(analysis, dict) else None
-        finding_sources_valid = isinstance(findings, list) and all(
-            isinstance(finding, dict)
-            and isinstance(finding.get("title"), str)
-            and bool(finding["title"].strip())
-            and isinstance(finding.get("validation"), str)
-            and bool(finding["validation"].strip())
-            and isinstance(finding.get("source_answer_ids"), list)
-            and bool(finding["source_answer_ids"])
-            and all(isinstance(source_id, str) for source_id in finding["source_answer_ids"])
-            and len(set(finding["source_answer_ids"])) == len(finding["source_answer_ids"])
-            and set(finding["source_answer_ids"]) <= expected_ids
-            and self._valid_evidence_contract(finding, workspace)
-            for finding in findings
-        )
-        if (
-            analysis_schema_problem is not None
-            or not isinstance(analysis, dict)
-            or not isinstance(analysis.get("recommended_answer"), str)
-            or not analysis["recommended_answer"].strip()
-            or len(assessments or []) != len(answers)
-            or assessment_ids != expected_ids
-            or not finding_sources_valid
-        ):
-            analysis = None
-            result["artifact_error"] = result.get(
-                "artifact_error",
-                analysis_schema_problem or "missing or invalid structured analysis",
+        raw_analysis = copy.deepcopy(analysis)
+        reference_repairs = _promote_analysis_source_references(analysis, workspace)
+        if reference_repairs:
+            raw_path = execution_dir / "analysis.raw.json"
+            if spec.artifact_path is not None and spec.artifact_path.is_file():
+                shutil.copy2(spec.artifact_path, raw_path)
+            else:
+                write_json(raw_path, raw_analysis)
+            if spec.artifact_path is not None:
+                write_json(spec.artifact_path, analysis)
+            result["raw_analysis_sha256"] = sha256_file(raw_path)
+            result["normalized_reproduction_references"] = reference_repairs
+            self._emit(
+                "[primary analysis] completed omitted source references from "
+                f"existing evidence for {len(reference_repairs)} finding(s)"
             )
+        analysis_problem = _analysis_contract_error(
+            analysis, expected_ids=expected_ids, workspace=workspace
+        )
+        if analysis_problem is not None:
+            analysis = None
+            result["artifact_error"] = result.get("artifact_error") or analysis_problem
         result["analysis_valid"] = analysis is not None
         result["analysis_sha256"] = (
             sha256_file(spec.artifact_path)
@@ -460,7 +529,7 @@ class AdjudicationMixin:
         self._publish_stage_files(
             execution_dir,
             artifact_dir,
-            ("stdout.jsonl", "stderr.log", "analysis.json"),
+            ("stdout.jsonl", "stderr.log", "analysis.json", "analysis.raw.json"),
         )
         if analysis is not None and result.get("status") == "completed":
             try:
